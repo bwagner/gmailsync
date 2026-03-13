@@ -2,7 +2,7 @@
 
 Uploads incoming mail to Gmail via IMAP, triggered by procmail. A replacement for Gmail's discontinued ["fetch mail from other accounts"](https://support.google.com/mail/answer/16604719) feature.
 
-Full write-up: https://nosuch.biz/docs/mailsync/
+Full write-up: https://nosuch.biz/mailsync/
 
 ## Prerequisites
 
