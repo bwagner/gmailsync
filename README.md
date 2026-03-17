@@ -30,7 +30,7 @@ PATH=$HOME/.local/bin:$PATH
 $HOME/Maildir/
 ```
 
-## Usage
+## Testing Upload to Gmail
 
 ```bash
 # Upload a specific .eml file
