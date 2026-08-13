@@ -8,11 +8,22 @@ import configparser
 import email
 import imaplib
 import re
+import sys
 import time
 import uuid
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "mailsync" / "config"
+
+IMAP_HOST = "imap.gmail.com"
+IMAP_PORT = 993
+
+# IMAP4 tagged-response status meaning the server accepted the command (RFC 3501).
+STATUS_OK = "OK"
+
+
+class AppendError(Exception):
+    """The IMAP server refused the APPEND."""
 
 
 def load_config() -> tuple[str, str]:
@@ -34,8 +45,29 @@ def save_config(user: str, app_password: str) -> None:
     print(f"Credentials saved to {CONFIG_PATH}")
 
 
-def upload_eml_to_gmail(eml_path: str, gmail_user: str, app_password: str, mailbox: str = "INBOX", fake_id: bool = False) -> None:
-    import sys
+def _describe(data: list | None) -> str:
+    """Flatten imaplib's response data into one readable line."""
+    parts = []
+    for item in data or []:
+        if item is None:
+            continue
+        parts.append(item.decode(errors="replace") if isinstance(item, bytes) else str(item))
+    return " ".join(parts)
+
+
+def check_append_result(typ: str, data: list | None) -> None:
+    """Raise AppendError unless the server accepted the APPEND.
+
+    imaplib raises on a tagged BAD by itself, but returns NO as an ordinary
+    result - so an unchecked append() reports quota, size and policy refusals
+    as success.
+    """
+    if typ == STATUS_OK:
+        return
+    raise AppendError(f"APPEND failed: {typ} {_describe(data)}".rstrip())
+
+
+def upload_eml_to_gmail(eml_path: str, gmail_user: str, app_password: str, mailbox: str = "INBOX", fake_id: bool = False, imap_factory=imaplib.IMAP4_SSL) -> None:
     eml = sys.stdin.buffer.read() if eml_path == "-" else Path(eml_path).read_bytes()
 
     if fake_id:
@@ -50,10 +82,11 @@ def upload_eml_to_gmail(eml_path: str, gmail_user: str, app_password: str, mailb
     else:
         timestamp = time.time()
 
-    with imaplib.IMAP4_SSL("imap.gmail.com", 993) as imap:
+    with imap_factory(IMAP_HOST, IMAP_PORT) as imap:
         imap.login(gmail_user, app_password)
-        result = imap.append(mailbox, None, imaplib.Time2Internaldate(timestamp), eml)
-        print(f"Result: {result}")
+        typ, data = imap.append(mailbox, None, imaplib.Time2Internaldate(timestamp), eml)
+        print(f"Result: {typ} {_describe(data)}".rstrip())
+        check_append_result(typ, data)
 
 
 if __name__ == "__main__":
@@ -83,4 +116,8 @@ if __name__ == "__main__":
     app_password = saved_password or getpass.getpass("Gmail App Password: ")
 
     eml_path = args.eml or "-"
-    upload_eml_to_gmail(eml_path, gmail_user, app_password, args.mailbox, args.fake_id)
+    try:
+        upload_eml_to_gmail(eml_path, gmail_user, app_password, args.mailbox, args.fake_id)
+    except AppendError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(1)
