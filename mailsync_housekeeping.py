@@ -51,6 +51,10 @@ CRONTAB = "crontab"
 DAY_SECONDS = 86400
 CRON_SCHEDULE = "0 *"  # top of every hour
 
+# The suggested cron line runs quiet: otherwise the hourly summary is mailed by
+# cron every hour, into the mailbox this job exists to keep tidy.
+QUIET_FLAG = "-q"
+
 
 @dataclass
 class Outcome:
@@ -200,7 +204,7 @@ def count_matches(code: int, out: str) -> int | None:
 
 
 def cron_line(script_path: str) -> str:
-    return f"{CRON_SCHEDULE} * * * {script_path}"
+    return f"{CRON_SCHEDULE} * * * {script_path} {QUIET_FLAG}"
 
 
 def cron_instructions(script_path: str, crontab_available: bool) -> str:
@@ -219,6 +223,9 @@ def cron_instructions(script_path: str, crontab_available: bool) -> str:
         f"     {cron_line(script_path)}\n"
         "\n"
         "  3. save and exit; 'crontab -l' shows it, 'crontab -r' removes it all.\n"
+        "\n"
+        f"     {QUIET_FLAG} keeps it silent unless something is stranded or a\n"
+        "     command fails; drop it to get an hourly summary by mail.\n"
     )
 
 

@@ -301,6 +301,12 @@ def test_cron_line_is_hourly():
     assert hk.cron_line("/x").split()[0:2] == ["0", "*"]
 
 
+def test_cron_line_is_quiet():
+    """Without -q the job prints a summary every hour, and cron mails each one -
+    24 messages a day into the very mailbox this is meant to keep tidy."""
+    assert hk.cron_line("/x").endswith(hk.QUIET_FLAG)
+
+
 def test_cron_instructions_mention_how_to_install():
     text = hk.cron_instructions("/x/y.py", crontab_available=True)
     assert "crontab -e" in text
