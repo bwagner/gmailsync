@@ -23,12 +23,32 @@ Add to `.procmailrc`:
 ```
 PATH=$HOME/.local/bin:$PATH
 
-:0 c
+:0 cw
 | $HOME/bin/upload_eml.py -
-
-:0
-$HOME/Maildir/
 ```
+
+Put it where mail you want in Gmail will reach it - typically last, so anything
+your earlier recipes filed away is not also uploaded.
+
+The two flags both matter:
+
+- **`c`** makes this a copy. The message carries on to your normal delivery
+  afterwards, so a failed upload costs the Gmail copy rather than the mail.
+- **`w`** makes procmail wait for the script and check its exit code. Without
+  it the exit code is discarded and a failed upload is completely silent - the
+  log shows the script ran and nothing else. With it, a failure appears as
+  `procmail: Program failure (1)`.
+
+`w` means procmail waits for the IMAP round trip before continuing, which
+delays delivery slightly. Gmail's IMAP latency is heavy-tailed - usually a
+fraction of a second, occasionally tens of seconds - so `upload_eml.py` bounds
+every socket operation at 60s to keep a stalled connection from blocking
+procmail until its own `TIMEOUT` (960s by default) fires.
+
+**Do not add an explicit delivery recipe after this one.** Mail that falls off
+the end of `.procmailrc` is delivered by procmail's `$DEFAULT` fallback, so
+local delivery already happens. An explicit recipe would stop processing at
+that point, and any recipe below it would never run.
 
 ## Testing Upload to Gmail
 
