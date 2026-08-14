@@ -71,8 +71,13 @@ there is nothing to unwrap.
 **`mailsync_housekeeping.py`** - run hourly from cron. Retries uploads that
 failed (`upload_eml.py` spools them), gives up after a week by saving the
 message to a `Stranded` mailbox and mailing a summary, then expires old mail
-from the local INBOX. `--show-cron` checks whether cron is usable and prints the
-line to install; `--dry-run` reports without changing anything.
+from the local INBOX. `--show-cron` checks whether cron and uv are usable and
+prints the line to install; `--dry-run` reports without changing anything.
+
+The suggested line spells out the path to `uv` rather than relying on the
+shebang. Cron runs with a PATH that does not include where the uv installer
+puts it, so a bare script path fails with `env: 'uv': No such file or
+directory` before python starts.
 
 **`check_deployment.py`** - deployment is a manual copy, so nothing detects
 drift. This compares each file's committed, working-tree and deployed versions

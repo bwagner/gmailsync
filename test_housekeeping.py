@@ -7,6 +7,9 @@ Every external effect is injected: `upload` stands in for the gmail APPEND and
 """
 
 import email
+import os
+import pwd
+import sys
 import time
 
 import pytest
@@ -290,31 +293,127 @@ def test_expiry_can_be_previewed_without_deleting():
 
 
 # --- cron helper ------------------------------------------------------------
+#
+# The job installed on 2026-08-14 never ran once: cron's PATH holds no
+# ~/.local/bin, so `#!/usr/bin/env -S uv run --script` died with
+# "'uv': No such file or directory" before python started. The suggested line
+# must therefore not depend on what cron happens to put on PATH.
+
+UV_PATH = "/home/u/.local/bin/uv"
 
 
 def test_cron_line_runs_the_script():
-    line = hk.cron_line("/home/u/bin/mailsync_housekeeping.py")
+    line = hk.cron_line("/home/u/bin/mailsync_housekeeping.py", UV_PATH)
     assert "/home/u/bin/mailsync_housekeeping.py" in line
 
 
 def test_cron_line_is_hourly():
-    assert hk.cron_line("/x").split()[0:2] == ["0", "*"]
+    assert hk.cron_line("/x", UV_PATH).split()[0:2] == ["0", "*"]
 
 
 def test_cron_line_is_quiet():
     """Without -q the job prints a summary every hour, and cron mails each one -
     24 messages a day into the very mailbox this is meant to keep tidy."""
-    assert hk.cron_line("/x").endswith(hk.QUIET_FLAG)
+    assert hk.cron_line("/x", UV_PATH).endswith(hk.QUIET_FLAG)
+
+
+def test_cron_line_names_the_interpreter_by_absolute_path():
+    """The shebang resolves uv on PATH; cron's PATH does not contain it."""
+    assert hk.cron_line("/x/y.py", UV_PATH).startswith(f"{hk.CRON_SCHEDULE} * * * {UV_PATH} ")
+
+
+def test_cron_line_runs_the_script_as_a_uv_script():
+    line = hk.cron_line("/x/y.py", UV_PATH)
+    assert f"{UV_PATH} run --script /x/y.py" in line
+
+
+def test_cron_line_puts_the_flag_after_the_script_so_uv_does_not_eat_it():
+    """`-q` is also a uv flag. After the script path it belongs to the script."""
+    line = hk.cron_line("/x/y.py", UV_PATH)
+    assert line.index("/x/y.py") < line.index(hk.QUIET_FLAG)
 
 
 def test_cron_instructions_mention_how_to_install():
-    text = hk.cron_instructions("/x/y.py", crontab_available=True)
+    text = hk.cron_instructions("/x/y.py", crontab_available=True, uv_path=UV_PATH)
     assert "crontab -e" in text
 
 
 def test_cron_instructions_say_so_when_cron_is_missing():
-    text = hk.cron_instructions("/x/y.py", crontab_available=False)
+    text = hk.cron_instructions("/x/y.py", crontab_available=False, uv_path=UV_PATH)
     assert "not" in text.lower()
+
+
+def test_cron_instructions_say_so_when_uv_is_missing():
+    """Printing a line that cannot run is what caused the outage this guards."""
+    text = hk.cron_instructions("/x/y.py", crontab_available=True, uv_path=None)
+    assert hk.UV in text
+    assert "not" in text.lower()
+
+
+def test_cron_instructions_suggest_no_line_when_uv_is_missing():
+    text = hk.cron_instructions("/x/y.py", crontab_available=True, uv_path=None)
+    assert hk.CRON_SCHEDULE not in text
+
+
+# --- USER in the environment doveadm inherits -------------------------------
+#
+# Measured on the deployment host 2026-08-14: cron sets HOME, LOGNAME, PATH,
+# LANG, SHELL and PWD, and no USER. doveadm refuses to start without it -
+# "Fatal: USER environment is missing and -u option not used" - so under cron
+# every doveadm call failed: no expiry, and stranding silently impossible.
+
+
+def test_user_is_supplied_from_logname_when_absent():
+    env = hk.env_with_user({"LOGNAME": "someone", "HOME": "/home/someone"})
+    assert env[hk.USER_VAR] == "someone"
+
+
+def test_an_existing_user_is_left_alone():
+    env = hk.env_with_user({"USER": "real", "LOGNAME": "other"})
+    assert env[hk.USER_VAR] == "real"
+
+
+def test_an_empty_user_is_replaced():
+    """An empty string is as useless to doveadm as no variable at all."""
+    env = hk.env_with_user({"USER": "", "LOGNAME": "someone"})
+    assert env[hk.USER_VAR] == "someone"
+
+
+def test_the_rest_of_the_environment_survives():
+    env = hk.env_with_user({"LOGNAME": "someone", "PATH": "/bin"})
+    assert env["PATH"] == "/bin"
+
+
+def test_the_caller_environment_is_not_mutated():
+    original = {"LOGNAME": "someone"}
+    hk.env_with_user(original)
+    assert hk.USER_VAR not in original
+
+
+def test_user_falls_back_to_the_account_owner():
+    """cron sets LOGNAME, but nothing guarantees another scheduler will."""
+    assert hk.env_with_user({})[hk.USER_VAR] == pwd.getpwuid(os.getuid()).pw_name
+
+
+def test_run_command_supplies_user_to_the_child(monkeypatch):
+    """The regression itself: a child process must see USER even when we do not."""
+    monkeypatch.delenv(hk.USER_VAR, raising=False)
+    monkeypatch.setenv("LOGNAME", "cronuser")
+    code, out = hk.run_command(
+        [sys.executable, "-c", "import os; print(os.environ['USER'])"]
+    )
+    assert code == 0
+    assert out.strip() == "cronuser"
+
+
+def test_run_command_passes_the_rest_of_the_environment_through(monkeypatch):
+    """Passing an env replaces it wholesale, so PATH and HOME must survive."""
+    monkeypatch.setenv("MAILSYNC_TEST_MARKER", "kept")
+    code, out = hk.run_command(
+        [sys.executable, "-c", "import os; print(os.environ['MAILSYNC_TEST_MARKER'])"]
+    )
+    assert code == 0
+    assert out.strip() == "kept"
 
 
 # --- degrading when doveadm is absent ---------------------------------------

@@ -17,7 +17,9 @@ Run hourly from cron. Three jobs, in this order:
 Step 3 is independent of 1 and 2: a failed message exists in the spool or in
 `Stranded`, never only in INBOX, so expiry cannot destroy the last copy.
 
-`--show-cron` checks whether cron is usable and prints the line to install.
+`--show-cron` checks whether cron and uv are usable and prints the line to
+install. It names uv by absolute path: cron's PATH does not include where the
+installer puts it, so the shebang alone cannot start this script from cron.
 
 Deployed alongside upload_eml.py, which it imports - python puts the script's
 own directory on sys.path, so both living in ~/bin/ is enough.
@@ -25,6 +27,8 @@ own directory on sys.path, so both living in ~/bin/ is enough.
 
 import email
 import email.utils
+import os
+import pwd
 import subprocess
 import sys
 import time
@@ -48,6 +52,7 @@ INBOX_RETENTION_DAYS = 30
 
 DOVEADM = "doveadm"
 CRONTAB = "crontab"
+UV = "uv"
 DAY_SECONDS = 86400
 CRON_SCHEDULE = "0 *"  # top of every hour
 
@@ -55,12 +60,36 @@ CRON_SCHEDULE = "0 *"  # top of every hour
 # cron every hour, into the mailbox this job exists to keep tidy.
 QUIET_FLAG = "-q"
 
+# doveadm reads the account to act on from USER, and exits before doing anything
+# if it is unset: "Fatal: USER environment is missing and -u option not used".
+# cron supplies HOME, LOGNAME, PATH, LANG, SHELL and PWD - measured on the
+# deployment host - and no USER, so every doveadm call needs this filled in.
+USER_VAR = "USER"
+LOGNAME_VAR = "LOGNAME"
+
 
 @dataclass
 class Outcome:
     uploaded: int = 0
     still_pending: int = 0
     stranded: list = field(default_factory=list)
+
+
+def env_with_user(env) -> dict[str, str]:
+    """A copy of `env` with USER filled in, for the benefit of doveadm.
+
+    Falls back to LOGNAME, which cron does set, and then to the account owning
+    this process, since nothing guarantees another scheduler sets either. If
+    even that cannot be resolved the environment is returned unchanged, leaving
+    doveadm to report the problem itself rather than raising here.
+    """
+    if env.get(USER_VAR):
+        return dict(env)
+    try:
+        owner = env.get(LOGNAME_VAR) or pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return dict(env)
+    return {**env, USER_VAR: owner}
 
 
 def run_command(cmd: list[str], input: bytes | None = None) -> tuple[int, str]:
@@ -72,7 +101,13 @@ def run_command(cmd: list[str], input: bytes | None = None) -> tuple[int, str]:
     caller degrade in the direction that keeps messages.
     """
     try:
-        proc = subprocess.run(cmd, input=input, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        proc = subprocess.run(
+            cmd,
+            input=input,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env_with_user(os.environ),
+        )
     except (FileNotFoundError, PermissionError) as exc:
         return 1, f"could not run {cmd[0]}: {exc}"
     return proc.returncode, proc.stdout.decode(errors="replace")
@@ -203,16 +238,34 @@ def count_matches(code: int, out: str) -> int | None:
     return len([line for line in out.splitlines() if line.strip()])
 
 
-def cron_line(script_path: str) -> str:
-    return f"{CRON_SCHEDULE} * * * {script_path} {QUIET_FLAG}"
+def cron_line(script_path: str, uv_path: str) -> str:
+    """The crontab line to install, naming the interpreter outright.
+
+    Running the script by its own path relies on the `env -S uv run --script`
+    shebang finding uv on PATH. Under cron it does not: cron's PATH holds no
+    ~/.local/bin, where the installer puts uv, so the job dies with
+    "/usr/bin/env: 'uv': No such file or directory" before python starts. An
+    absolute path removes the dependency on what cron happens to provide.
+
+    `QUIET_FLAG` goes after the script path, where it belongs to the script;
+    before it, uv would take it as its own --quiet.
+    """
+    return f"{CRON_SCHEDULE} * * * {uv_path} run --script {script_path} {QUIET_FLAG}"
 
 
-def cron_instructions(script_path: str, crontab_available: bool) -> str:
+def cron_instructions(script_path: str, crontab_available: bool, uv_path: str | None) -> str:
     if not crontab_available:
         return (
             f"cron does not appear to be available to this user: '{CRONTAB}' was\n"
             "not found on PATH. Without it this script has nothing to run it\n"
             "periodically - run it by hand, or ask the administrator about cron."
+        )
+    if uv_path is None:
+        return (
+            f"cron is available, but '{UV}' was not found on PATH, so there is no\n"
+            "line to suggest: the cron job would run this script through a shebang\n"
+            f"that cannot resolve {UV} either. Install it first\n"
+            "(https://docs.astral.sh/uv/), then run this again."
         )
     return (
         "cron is available. To run housekeeping every hour:\n"
@@ -220,9 +273,12 @@ def cron_instructions(script_path: str, crontab_available: bool) -> str:
         "  1. crontab -e\n"
         "  2. add this line:\n"
         "\n"
-        f"     {cron_line(script_path)}\n"
+        f"     {cron_line(script_path, uv_path)}\n"
         "\n"
         "  3. save and exit; 'crontab -l' shows it, 'crontab -r' removes it all.\n"
+        "\n"
+        f"     {uv_path} is spelled out because cron's PATH does not include it,\n"
+        "     so running the script by its own path fails in the shebang.\n"
         "\n"
         f"     {QUIET_FLAG} keeps it silent unless something is stranded or a\n"
         "     command fails; drop it to get an hourly summary by mail.\n"
@@ -233,6 +289,12 @@ def crontab_available() -> bool:
     import shutil
 
     return shutil.which(CRONTAB) is not None
+
+
+def uv_path() -> str | None:
+    import shutil
+
+    return shutil.which(UV)
 
 
 def main(argv=None) -> int:
@@ -251,7 +313,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.show_cron:
-        print(cron_instructions(str(Path(__file__).resolve()), crontab_available()))
+        print(cron_instructions(str(Path(__file__).resolve()), crontab_available(), uv_path()))
         return 0
 
     gmail_user, app_password = upload_eml.load_config()
