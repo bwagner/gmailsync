@@ -39,3 +39,31 @@ upload_eml.py /path/to/message.eml
 # Test with a unique Message-ID (bypasses Gmail deduplication)
 upload_eml.py --fake-id /path/to/message.eml
 ```
+
+## The other scripts
+
+All are stdlib-only and deployed the same way - copy the single file.
+
+**`unwrap_spam.py`** - extracts the original message from a SpamAssassin
+wrapper, for piping from a `.procmailrc` recipe. Returns its input unchanged if
+there is nothing to unwrap.
+
+**`mailsync_housekeeping.py`** - run hourly from cron. Retries uploads that
+failed (`upload_eml.py` spools them), gives up after a week by saving the
+message to a `Stranded` mailbox and mailing a summary, then expires old mail
+from the local INBOX. `--show-cron` checks whether cron is usable and prints the
+line to install; `--dry-run` reports without changing anything.
+
+**`check_deployment.py`** - deployment is a manual copy, so nothing detects
+drift. This compares each file's committed, working-tree and deployed versions
+and names which pair disagrees. Host and file mapping come from a config file;
+`--example-config` prints a template. Exits nonzero if anything differs.
+
+## Tests
+
+```bash
+uv run --with pytest pytest -q
+```
+
+No `pyproject.toml` and no declared dependencies - pytest is supplied by uv at
+run time, so the scripts stay stdlib-only and deployable as single files.
