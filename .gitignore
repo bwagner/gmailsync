@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+__marimo__/
+
+# local procmail log copy, large and not ours to publish
+pmlog
