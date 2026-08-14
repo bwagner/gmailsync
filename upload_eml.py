@@ -18,6 +18,12 @@ CONFIG_PATH = Path.home() / ".config" / "mailsync" / "config"
 IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
 
+# Bounds every blocking socket operation - connect, and each read and write -
+# not the session as a whole. Without it a hung server blocks forever, which is
+# survivable only while the caller fires and forgets; a caller that waits for
+# this process waits with it.
+IMAP_TIMEOUT_SECONDS = 60
+
 # IMAP4 tagged-response status meaning the server accepted the command (RFC 3501).
 STATUS_OK = "OK"
 
@@ -67,7 +73,7 @@ def check_append_result(typ: str, data: list | None) -> None:
     raise AppendError(f"APPEND failed: {typ} {_describe(data)}".rstrip())
 
 
-def upload_eml_to_gmail(eml_path: str, gmail_user: str, app_password: str, mailbox: str = "INBOX", fake_id: bool = False, imap_factory=imaplib.IMAP4_SSL) -> None:
+def upload_eml_to_gmail(eml_path: str, gmail_user: str, app_password: str, mailbox: str = "INBOX", fake_id: bool = False, imap_factory=imaplib.IMAP4_SSL, timeout: int = IMAP_TIMEOUT_SECONDS) -> None:
     eml = sys.stdin.buffer.read() if eml_path == "-" else Path(eml_path).read_bytes()
 
     if fake_id:
@@ -82,7 +88,7 @@ def upload_eml_to_gmail(eml_path: str, gmail_user: str, app_password: str, mailb
     else:
         timestamp = time.time()
 
-    with imap_factory(IMAP_HOST, IMAP_PORT) as imap:
+    with imap_factory(IMAP_HOST, IMAP_PORT, timeout=timeout) as imap:
         imap.login(gmail_user, app_password)
         typ, data = imap.append(mailbox, None, imaplib.Time2Internaldate(timestamp), eml)
         print(f"Result: {typ} {_describe(data)}".rstrip())
@@ -120,4 +126,7 @@ if __name__ == "__main__":
         upload_eml_to_gmail(eml_path, gmail_user, app_password, args.mailbox, args.fake_id)
     except AppendError as exc:
         print(exc, file=sys.stderr)
+        sys.exit(1)
+    except TimeoutError as exc:
+        print(f"IMAP timed out after {IMAP_TIMEOUT_SECONDS}s: {exc}", file=sys.stderr)
         sys.exit(1)

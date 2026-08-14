@@ -113,8 +113,8 @@ def make_factory(fake):
     """A stand-in for the IMAP4_SSL constructor, recording how it was called."""
     calls = []
 
-    def factory(host, port):
-        calls.append((host, port))
+    def factory(host, port, timeout=None):
+        calls.append({"host": host, "port": port, "timeout": timeout})
         return fake
 
     factory.calls = calls
@@ -198,5 +198,76 @@ def test_upload_connects_to_gmail_by_default(eml_file):
     upload_eml.upload_eml_to_gmail(
         eml_file, GMAIL_USER, APP_PASSWORD, SCRATCH_MAILBOX, imap_factory=factory
     )
-    host, port = factory.calls[0]
-    assert host == upload_eml.IMAP_HOST and port == upload_eml.IMAP_PORT
+    call = factory.calls[0]
+    assert call["host"] == upload_eml.IMAP_HOST and call["port"] == upload_eml.IMAP_PORT
+
+
+# --- socket timeout ---------------------------------------------------------
+#
+# Without one, a hung server blocks forever. That is survivable only while the
+# procmail recipe fires and forgets; once the recipe gains `w`, procmail waits
+# for this process and the MTA waits with it.
+
+# procmail's TIMEOUT default, i.e. when procmail would TERMINATE us anyway.
+# The socket timeout has to be comfortably inside it to be the thing that acts.
+PROCMAIL_DEFAULT_TIMEOUT_SECONDS = 960
+
+CUSTOM_TIMEOUT = 5
+
+
+def test_the_connection_is_given_a_timeout(eml_file):
+    fake = FakeIMAP()
+    factory = make_factory(fake)
+    upload_eml.upload_eml_to_gmail(
+        eml_file, GMAIL_USER, APP_PASSWORD, SCRATCH_MAILBOX, imap_factory=factory
+    )
+    assert factory.calls[0]["timeout"] is not None
+
+
+def test_the_default_timeout_is_the_named_constant(eml_file):
+    fake = FakeIMAP()
+    factory = make_factory(fake)
+    upload_eml.upload_eml_to_gmail(
+        eml_file, GMAIL_USER, APP_PASSWORD, SCRATCH_MAILBOX, imap_factory=factory
+    )
+    assert factory.calls[0]["timeout"] == upload_eml.IMAP_TIMEOUT_SECONDS
+
+
+def test_a_custom_timeout_is_passed_through(eml_file):
+    fake = FakeIMAP()
+    factory = make_factory(fake)
+    upload_eml.upload_eml_to_gmail(
+        eml_file,
+        GMAIL_USER,
+        APP_PASSWORD,
+        SCRATCH_MAILBOX,
+        imap_factory=factory,
+        timeout=CUSTOM_TIMEOUT,
+    )
+    assert factory.calls[0]["timeout"] == CUSTOM_TIMEOUT
+
+
+def test_the_timeout_is_positive_and_inside_procmails_ceiling():
+    """Bounds rather than pins the value: it must actually bound a hang, and it
+    must fire before procmail would kill us, or it buys nothing. imaplib also
+    rejects a zero timeout outright."""
+    assert 0 < upload_eml.IMAP_TIMEOUT_SECONDS < PROCMAIL_DEFAULT_TIMEOUT_SECONDS
+
+
+class HangingIMAP(FakeIMAP):
+    """Stands in for a server that accepts the connection and then stops."""
+
+    def login(self, user, password):
+        raise TimeoutError("timed out")
+
+
+def test_a_timeout_propagates_out_of_the_upload(eml_file):
+    with pytest.raises(TimeoutError):
+        upload(eml_file, HangingIMAP())
+
+
+def test_the_connection_closes_when_the_server_hangs(eml_file):
+    fake = HangingIMAP()
+    with pytest.raises(TimeoutError):
+        upload(eml_file, fake)
+    assert fake.exited
