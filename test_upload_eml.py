@@ -122,37 +122,35 @@ def make_factory(fake):
 
 
 @pytest.fixture
-def eml_file(tmp_path):
-    path = tmp_path / "message.eml"
-    path.write_bytes(SAMPLE_EML.encode())
-    return str(path)
+def eml_bytes():
+    return SAMPLE_EML.encode()
 
 
-def upload(eml_file, fake, mailbox=SCRATCH_MAILBOX):
+def upload(eml_bytes, fake, mailbox=SCRATCH_MAILBOX):
     return upload_eml.upload_eml_to_gmail(
-        eml_file, GMAIL_USER, APP_PASSWORD, mailbox, imap_factory=make_factory(fake)
+        eml_bytes, GMAIL_USER, APP_PASSWORD, mailbox, imap_factory=make_factory(fake)
     )
 
 
-def test_upload_logs_in_with_the_given_credentials(eml_file):
+def test_upload_logs_in_with_the_given_credentials(eml_bytes):
     fake = FakeIMAP()
-    upload(eml_file, fake)
+    upload(eml_bytes, fake)
     assert fake.credentials == (GMAIL_USER, APP_PASSWORD)
 
 
-def test_upload_appends_the_message_bytes(eml_file):
+def test_upload_appends_the_message_bytes(eml_bytes):
     fake = FakeIMAP()
-    upload(eml_file, fake)
+    upload(eml_bytes, fake)
     assert fake.appends[0]["message"] == SAMPLE_EML.encode()
 
 
-def test_upload_appends_to_the_requested_mailbox(eml_file):
+def test_upload_appends_to_the_requested_mailbox(eml_bytes):
     fake = FakeIMAP()
-    upload(eml_file, fake)
+    upload(eml_bytes, fake)
     assert fake.appends[0]["mailbox"] == SCRATCH_MAILBOX
 
 
-def test_upload_dates_the_message_from_its_date_header(eml_file):
+def test_upload_dates_the_message_from_its_date_header(eml_bytes):
     """INTERNALDATE comes from Date:, not from now - computed the same way here
     so the assertion holds in any local timezone."""
     import email.utils
@@ -162,41 +160,41 @@ def test_upload_dates_the_message_from_its_date_header(eml_file):
         email.utils.parsedate_to_datetime(SAMPLE_DATE).timestamp()
     )
     fake = FakeIMAP()
-    upload(eml_file, fake)
+    upload(eml_bytes, fake)
     assert fake.appends[0]["date_time"] == expected
 
 
-def test_upload_succeeds_when_the_server_says_ok(eml_file):
+def test_upload_succeeds_when_the_server_says_ok(eml_bytes):
     fake = FakeIMAP(status=STATUS_OK)
-    upload(eml_file, fake)
+    upload(eml_bytes, fake)
 
 
-def test_upload_raises_when_the_server_says_no(eml_file):
+def test_upload_raises_when_the_server_says_no(eml_bytes):
     fake = FakeIMAP(status=STATUS_NO, data=[b"[OVERQUOTA] Not enough storage space"])
     with pytest.raises(upload_eml.AppendError):
-        upload(eml_file, fake)
+        upload(eml_bytes, fake)
 
 
-def test_upload_reports_the_servers_reason(eml_file):
+def test_upload_reports_the_servers_reason(eml_bytes):
     fake = FakeIMAP(status=STATUS_NO, data=[b"[OVERQUOTA] Not enough storage space"])
     with pytest.raises(upload_eml.AppendError) as excinfo:
-        upload(eml_file, fake)
+        upload(eml_bytes, fake)
     assert "Not enough storage space" in str(excinfo.value)
 
 
-def test_upload_closes_the_connection_even_when_the_append_fails(eml_file):
+def test_upload_closes_the_connection_even_when_the_append_fails(eml_bytes):
     """The raise must happen inside the with-block, not after it."""
     fake = FakeIMAP(status=STATUS_NO)
     with pytest.raises(upload_eml.AppendError):
-        upload(eml_file, fake)
+        upload(eml_bytes, fake)
     assert fake.exited
 
 
-def test_upload_connects_to_gmail_by_default(eml_file):
+def test_upload_connects_to_gmail_by_default(eml_bytes):
     fake = FakeIMAP()
     factory = make_factory(fake)
     upload_eml.upload_eml_to_gmail(
-        eml_file, GMAIL_USER, APP_PASSWORD, SCRATCH_MAILBOX, imap_factory=factory
+        eml_bytes, GMAIL_USER, APP_PASSWORD, SCRATCH_MAILBOX, imap_factory=factory
     )
     call = factory.calls[0]
     assert call["host"] == upload_eml.IMAP_HOST and call["port"] == upload_eml.IMAP_PORT
@@ -215,29 +213,29 @@ PROCMAIL_DEFAULT_TIMEOUT_SECONDS = 960
 CUSTOM_TIMEOUT = 5
 
 
-def test_the_connection_is_given_a_timeout(eml_file):
+def test_the_connection_is_given_a_timeout(eml_bytes):
     fake = FakeIMAP()
     factory = make_factory(fake)
     upload_eml.upload_eml_to_gmail(
-        eml_file, GMAIL_USER, APP_PASSWORD, SCRATCH_MAILBOX, imap_factory=factory
+        eml_bytes, GMAIL_USER, APP_PASSWORD, SCRATCH_MAILBOX, imap_factory=factory
     )
     assert factory.calls[0]["timeout"] is not None
 
 
-def test_the_default_timeout_is_the_named_constant(eml_file):
+def test_the_default_timeout_is_the_named_constant(eml_bytes):
     fake = FakeIMAP()
     factory = make_factory(fake)
     upload_eml.upload_eml_to_gmail(
-        eml_file, GMAIL_USER, APP_PASSWORD, SCRATCH_MAILBOX, imap_factory=factory
+        eml_bytes, GMAIL_USER, APP_PASSWORD, SCRATCH_MAILBOX, imap_factory=factory
     )
     assert factory.calls[0]["timeout"] == upload_eml.IMAP_TIMEOUT_SECONDS
 
 
-def test_a_custom_timeout_is_passed_through(eml_file):
+def test_a_custom_timeout_is_passed_through(eml_bytes):
     fake = FakeIMAP()
     factory = make_factory(fake)
     upload_eml.upload_eml_to_gmail(
-        eml_file,
+        eml_bytes,
         GMAIL_USER,
         APP_PASSWORD,
         SCRATCH_MAILBOX,
@@ -261,13 +259,85 @@ class HangingIMAP(FakeIMAP):
         raise TimeoutError("timed out")
 
 
-def test_a_timeout_propagates_out_of_the_upload(eml_file):
+def test_a_timeout_propagates_out_of_the_upload(eml_bytes):
     with pytest.raises(TimeoutError):
-        upload(eml_file, HangingIMAP())
+        upload(eml_bytes, HangingIMAP())
 
 
-def test_the_connection_closes_when_the_server_hangs(eml_file):
+def test_the_connection_closes_when_the_server_hangs(eml_bytes):
     fake = HangingIMAP()
     with pytest.raises(TimeoutError):
-        upload(eml_file, fake)
+        upload(eml_bytes, fake)
     assert fake.exited
+
+
+# --- reading, Message-ID patching, and the failure spool --------------------
+#
+# The message bytes are read by __main__ rather than inside the upload, so that
+# a failed upload still has them to spool. Without that, a failure could only
+# report itself; it could not preserve anything.
+
+
+def test_read_eml_reads_a_file(tmp_path):
+    path = tmp_path / "m.eml"
+    path.write_bytes(SAMPLE_EML.encode())
+    assert upload_eml.read_eml(str(path)) == SAMPLE_EML.encode()
+
+
+def test_read_eml_reads_stdin_for_dash(monkeypatch):
+    import io
+
+    class FakeStdin:
+        buffer = io.BytesIO(SAMPLE_EML.encode())
+
+    monkeypatch.setattr(upload_eml.sys, "stdin", FakeStdin)
+    assert upload_eml.read_eml("-") == SAMPLE_EML.encode()
+
+
+def test_patch_message_id_replaces_the_header():
+    original = b"From: a@example.test\r\nMessage-ID: <old@example.test>\r\n\r\nbody\r\n"
+    patched, new_id = upload_eml.patch_message_id(original)
+    assert b"<old@example.test>" not in patched
+    assert new_id.encode() in patched
+
+
+def test_patch_message_id_returns_the_id_it_used():
+    patched, new_id = upload_eml.patch_message_id(b"Message-ID: <x@example.test>\r\n\r\nbody\r\n")
+    assert new_id.startswith("<") and new_id.endswith(">")
+
+
+def test_patch_message_id_leaves_a_message_without_one_alone():
+    original = b"From: a@example.test\r\n\r\nbody\r\n"
+    patched, _ = upload_eml.patch_message_id(original)
+    assert patched == original
+
+
+def test_spool_failed_writes_the_message(tmp_path):
+    path = upload_eml.spool_failed(SAMPLE_EML.encode(), tmp_path)
+    assert path.read_bytes() == SAMPLE_EML.encode()
+
+
+def test_spool_failed_creates_the_directory(tmp_path):
+    target = tmp_path / "does" / "not" / "exist"
+    upload_eml.spool_failed(b"x", target)
+    assert target.is_dir()
+
+
+def test_spool_failed_leaves_no_partial_files(tmp_path):
+    """Written under a temporary name and renamed, so a concurrent retry never
+    picks up a half-written message."""
+    upload_eml.spool_failed(SAMPLE_EML.encode(), tmp_path)
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".")] == []
+
+
+def test_spool_failed_does_not_collide(tmp_path):
+    a = upload_eml.spool_failed(b"first", tmp_path)
+    b = upload_eml.spool_failed(b"second", tmp_path)
+    assert a != b
+    assert {a.read_bytes(), b.read_bytes()} == {b"first", b"second"}
+
+
+def test_spooled_files_are_discoverable_by_suffix(tmp_path):
+    """The retry pass globs for this suffix; it has to match what is written."""
+    path = upload_eml.spool_failed(b"x", tmp_path)
+    assert path.suffix == upload_eml.SPOOL_SUFFIX

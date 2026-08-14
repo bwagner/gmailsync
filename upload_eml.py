@@ -7,6 +7,7 @@
 import configparser
 import email
 import imaplib
+import os
 import re
 import sys
 import time
@@ -14,6 +15,11 @@ import uuid
 from pathlib import Path
 
 CONFIG_PATH = Path.home() / ".config" / "mailsync" / "config"
+
+# Messages whose upload failed are kept here for a later retry pass. Under
+# XDG state rather than config: this is data the program manages, not settings.
+PENDING_DIR = Path.home() / ".local" / "state" / "mailsync" / "pending"
+SPOOL_SUFFIX = ".eml"
 
 IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
@@ -73,14 +79,39 @@ def check_append_result(typ: str, data: list | None) -> None:
     raise AppendError(f"APPEND failed: {typ} {_describe(data)}".rstrip())
 
 
-def upload_eml_to_gmail(eml_path: str, gmail_user: str, app_password: str, mailbox: str = "INBOX", fake_id: bool = False, imap_factory=imaplib.IMAP4_SSL, timeout: int = IMAP_TIMEOUT_SECONDS) -> None:
-    eml = sys.stdin.buffer.read() if eml_path == "-" else Path(eml_path).read_bytes()
+def read_eml(eml_path: str) -> bytes:
+    """Read the message from a file, or from stdin when eml_path is '-'."""
+    return sys.stdin.buffer.read() if eml_path == "-" else Path(eml_path).read_bytes()
 
-    if fake_id:
-        new_id = f"<test-{uuid.uuid4()}@mailsync.local>"
-        eml = re.sub(rb"(?im)^Message-ID:.*$", f"Message-ID: {new_id}".encode(), eml, count=1)
-        print(f"Patched Message-ID: {new_id}")
 
+def patch_message_id(eml: bytes) -> tuple[bytes, str]:
+    """Replace the Message-ID so gmail treats this as a new message.
+
+    Gmail dedupes on Message-ID, which is normally what you want - it makes a
+    retry idempotent - so this exists only for deliberately forcing a copy.
+    A message with no Message-ID is returned unchanged.
+    """
+    new_id = f"<test-{uuid.uuid4()}@mailsync.local>"
+    return re.sub(rb"(?im)^Message-ID:.*$", f"Message-ID: {new_id}".encode(), eml, count=1), new_id
+
+
+def spool_failed(eml: bytes, pending_dir: Path = PENDING_DIR) -> Path:
+    """Keep a message that could not be uploaded, so a later pass can retry it.
+
+    Written under a dot-prefixed temporary name and renamed into place, so a
+    retry running concurrently never reads a half-written message.
+    """
+    pending_dir = Path(pending_dir)
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    stamp = f"{time.time():.6f}.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    tmp = pending_dir / f".{stamp}.partial"
+    tmp.write_bytes(eml)
+    final = pending_dir / f"{stamp}{SPOOL_SUFFIX}"
+    tmp.rename(final)
+    return final
+
+
+def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox: str = "INBOX", imap_factory=imaplib.IMAP4_SSL, timeout: int = IMAP_TIMEOUT_SECONDS) -> None:
     msg = email.message_from_bytes(eml)
     date_str = msg.get("Date")
     if date_str:
@@ -105,6 +136,7 @@ if __name__ == "__main__":
     parser.add_argument("--mailbox", default="INBOX")
     parser.add_argument("--fake-id", action="store_true", help="Replace Message-ID with a unique value to force a new copy")
     parser.add_argument("--save-credentials", action="store_true", help="Prompt for credentials and save to config file")
+    parser.add_argument("--no-spool", "-S", dest="spool", action="store_false", help=f"Do not keep a failed message in {PENDING_DIR} for retry")
     args = parser.parse_args()
 
     if args.save_credentials:
@@ -121,12 +153,21 @@ if __name__ == "__main__":
 
     app_password = saved_password or getpass.getpass("Gmail App Password: ")
 
-    eml_path = args.eml or "-"
+    eml = read_eml(args.eml or "-")
+    if args.fake_id:
+        eml, patched_id = patch_message_id(eml)
+        print(f"Patched Message-ID: {patched_id}")
+
     try:
-        upload_eml_to_gmail(eml_path, gmail_user, app_password, args.mailbox, args.fake_id)
-    except AppendError as exc:
-        print(exc, file=sys.stderr)
-        sys.exit(1)
-    except TimeoutError as exc:
-        print(f"IMAP timed out after {IMAP_TIMEOUT_SECONDS}s: {exc}", file=sys.stderr)
+        upload_eml_to_gmail(eml, gmail_user, app_password, args.mailbox)
+    except (AppendError, TimeoutError) as exc:
+        reason = exc if isinstance(exc, AppendError) else f"IMAP timed out after {IMAP_TIMEOUT_SECONDS}s: {exc}"
+        print(reason, file=sys.stderr)
+        # Keep the message so a retry pass can upload it later. Without this the
+        # only copy is whatever the caller happens to have kept.
+        if args.spool:
+            try:
+                print(f"Spooled for retry: {spool_failed(eml)}", file=sys.stderr)
+            except OSError as spool_error:
+                print(f"Could not spool the message: {spool_error}", file=sys.stderr)
         sys.exit(1)
