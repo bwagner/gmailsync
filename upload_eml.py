@@ -200,6 +200,138 @@ def check_append_result(typ: str, data: list | None) -> None:
     raise AppendError(f"APPEND failed: {typ} {_describe(data)}".rstrip())
 
 
+# --- writing the label onto the message that was just appended --------------
+#
+# Everything below is subordinate to one rule: by the time any of it runs the
+# message is already in gmail, so no failure here may be reported as an upload
+# failure. A missing label is a cosmetic loss; a reported failure would spool
+# and re-upload a message that has already arrived, and would put a
+# `Program failure` line in the procmail log for a message that was delivered.
+
+HEADER_MESSAGE_ID = "Message-ID"
+
+# STORE is only valid in the selected state, so the mailbox has to be selected
+# even though APPEND did not need it.
+STORE_COMMAND = "STORE"
+SEARCH_COMMAND = "SEARCH"
+
+# Gmail's own label attribute (X-GM-EXT-1). Adding a custom label this way
+# creates it on first use, and `/` nests it in the sidebar.
+ADD_LABELS_ITEM = "+X-GM-LABELS"
+
+# Gmail's native search syntax over IMAP, and the operator naming one message.
+GMAIL_RAW_SEARCH = "X-GM-RAW"
+RFC822MSGID_OPERATOR = "rfc822msgid:"
+
+# The untagged response SELECT reports the mailbox's UIDVALIDITY in.
+UIDVALIDITY_CODE = "UIDVALIDITY"
+
+# RFC 3501 quoted strings: only these two characters need escaping, and the
+# backslash must be escaped first or it would escape the escapes.
+IMAP_QUOTE = '"'
+IMAP_ESCAPE = "\\"
+
+MESSAGE_ID_BRACKETS = "<>"
+
+# A Message-ID identifies exactly one message, and gmail dedupes on it, so more
+# than one hit means the assumption broke and nothing should be labelled.
+EXPECTED_SEARCH_HITS = 1
+
+
+def imap_quote(value: str) -> str:
+    """Wrap a value as an IMAP quoted string (RFC 3501).
+
+    Without this an embedded double quote reads as the end of the string and
+    gmail answers BAD rather than doing anything.
+    """
+    escaped = value.replace(IMAP_ESCAPE, IMAP_ESCAPE * 2).replace(IMAP_QUOTE, IMAP_ESCAPE + IMAP_QUOTE)
+    return f"{IMAP_QUOTE}{escaped}{IMAP_QUOTE}"
+
+
+def label_store_argument(label: str) -> str:
+    """The parenthesised label list a STORE +X-GM-LABELS takes."""
+    return f"({imap_quote(label)})"
+
+
+def rfc822msgid_query(message_id: str | None) -> str | None:
+    """A gmail search naming exactly this message, or None if it cannot be built.
+
+    The angle brackets are RFC 5322 syntax; gmail's operator wants the bare id.
+    Non-ASCII yields None rather than a query: imaplib encodes the command line
+    as ASCII, so sending one would raise inside the delivery path, and no label
+    is a better outcome than that.
+    """
+    if not message_id:
+        return None
+    bare = message_id.strip().strip(MESSAGE_ID_BRACKETS).strip()
+    if not bare or not bare.isascii():
+        return None
+    return RFC822MSGID_OPERATOR + bare
+
+
+def parse_search_uids(data: list | None) -> list[int]:
+    """The UIDs in a UID SEARCH response, ignoring anything unparseable."""
+    uids = []
+    for token in _describe(data).split():
+        try:
+            uids.append(int(token))
+        except ValueError:
+            continue
+    return uids
+
+
+def selected_uidvalidity(imap) -> int | None:
+    """UIDVALIDITY of the mailbox imaplib has selected, if the server said."""
+    _, data = imap.response(UIDVALIDITY_CODE)
+    values = parse_search_uids(data)
+    return values[0] if values else None
+
+
+def resolve_uid(imap, appenduid: AppendUid | None, message_id: str | None) -> int | None:
+    """Which UID in the selected mailbox holds the message just appended.
+
+    Prefers what APPEND reported, but only once the selected mailbox agrees
+    about UIDVALIDITY - a UID is meaningless without it, and this account really
+    does hand out a different one per mailbox. On disagreement, or when gmail
+    said nothing, fall back to finding the message by its Message-ID.
+    """
+    if appenduid is not None:
+        reported = selected_uidvalidity(imap)
+        if reported is None or reported == appenduid.uidvalidity:
+            return appenduid.uid
+    query = rfc822msgid_query(message_id)
+    if query is None:
+        return None
+    typ, data = imap.uid(SEARCH_COMMAND, None, GMAIL_RAW_SEARCH, imap_quote(query))
+    if typ != STATUS_OK:
+        return None
+    uids = parse_search_uids(data)
+    return uids[0] if len(uids) == EXPECTED_SEARCH_HITS else None
+
+
+def apply_label(imap, mailbox: str, label: str, appenduid: AppendUid | None, message_id: str | None) -> bool:
+    """Add the gmail label to the message just appended. True if it was applied.
+
+    Reports rather than raises: the caller has already delivered the message.
+    """
+    typ, _ = imap.select(mailbox)
+    if typ != STATUS_OK:
+        return False
+    uid = resolve_uid(imap, appenduid, message_id)
+    if uid is None:
+        return False
+    typ, _ = imap.uid(STORE_COMMAND, str(uid), ADD_LABELS_ITEM, label_store_argument(label))
+    return typ == STATUS_OK
+
+
+class UploadResult(NamedTuple):
+    """What became of one message: where it landed, and whether it got labelled."""
+
+    appenduid: AppendUid | None
+    label: str | None
+    labelled: bool
+
+
 def read_eml(eml_path: str) -> bytes:
     """Read the message from a file, or from stdin when eml_path is '-'."""
     return sys.stdin.buffer.read() if eml_path == "-" else Path(eml_path).read_bytes()
@@ -232,8 +364,13 @@ def spool_failed(eml: bytes, pending_dir: Path = PENDING_DIR) -> Path:
     return final
 
 
-def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox: str = "INBOX", imap_factory=imaplib.IMAP4_SSL, timeout: int = IMAP_TIMEOUT_SECONDS) -> AppendUid | None:
-    """Append the message to gmail, returning where it landed if gmail said."""
+def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox: str = "INBOX", imap_factory=imaplib.IMAP4_SSL, timeout: int = IMAP_TIMEOUT_SECONDS, apply_labels: bool = True) -> UploadResult:
+    """Append the message to gmail, and label it with the alias it was sent to.
+
+    The label is applied over the same connection, and only when the alias is
+    not already visible in To:/Cc: - which is most messages, and those pay no
+    extra round trip at all.
+    """
     msg = email.message_from_bytes(eml)
     date_str = msg.get("Date")
     if date_str:
@@ -246,7 +383,25 @@ def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox:
         typ, data = imap.append(mailbox, None, imaplib.Time2Internaldate(timestamp), eml)
         print(f"Result: {typ} {_describe(data)}".rstrip())
         check_append_result(typ, data)
-        return parse_appenduid(data)
+        appenduid = parse_appenduid(data)
+
+        label = label_for_message(msg) if apply_labels else None
+        if label is None:
+            return UploadResult(appenduid, None, False)
+
+        # The message is in gmail from here on, so nothing below may raise.
+        # Anything at all - a refusal, a stall, a response shaped differently
+        # than expected - costs the label and leaves the delivery successful.
+        try:
+            labelled = apply_label(imap, mailbox, label, appenduid, msg.get(HEADER_MESSAGE_ID))
+        except Exception as exc:  # noqa: BLE001
+            print(f"Uploaded but could not label {label}: {exc}", file=sys.stderr)
+            return UploadResult(appenduid, label, False)
+        if labelled:
+            print(f"Labelled: {label}")
+        else:
+            print(f"Uploaded but could not label {label}", file=sys.stderr)
+        return UploadResult(appenduid, label, labelled)
 
 
 if __name__ == "__main__":
@@ -260,6 +415,7 @@ if __name__ == "__main__":
     parser.add_argument("--fake-id", action="store_true", help="Replace Message-ID with a unique value to force a new copy")
     parser.add_argument("--save-credentials", action="store_true", help="Prompt for credentials and save to config file")
     parser.add_argument("--no-spool", "-S", dest="spool", action="store_false", help=f"Do not keep a failed message in {PENDING_DIR} for retry")
+    parser.add_argument("--no-label", "-L", dest="label", action="store_false", help="Do not label the message with the alias it was addressed to")
     args = parser.parse_args()
 
     if args.save_credentials:
@@ -282,7 +438,7 @@ if __name__ == "__main__":
         print(f"Patched Message-ID: {patched_id}")
 
     try:
-        upload_eml_to_gmail(eml, gmail_user, app_password, args.mailbox)
+        upload_eml_to_gmail(eml, gmail_user, app_password, args.mailbox, apply_labels=args.label)
     except (AppendError, TimeoutError) as exc:
         reason = exc if isinstance(exc, AppendError) else f"IMAP timed out after {IMAP_TIMEOUT_SECONDS}s: {exc}"
         print(reason, file=sys.stderr)

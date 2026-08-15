@@ -86,6 +86,11 @@ def test_multipart_data_is_joined():
 
 # Verbatim from a real gmail APPEND to INBOX, observed 2026-08-13.
 OBSERVED_APPEND_DATA = [b"[APPENDUID 596438452 165852] (Success)"]
+OBSERVED_UIDVALIDITY = 596438452
+OBSERVED_UID = 165852
+
+# The untagged response SELECT reports the mailbox's UIDVALIDITY in.
+UIDVALIDITY_CODE = "UIDVALIDITY"
 
 
 def test_the_observed_gmail_response_is_parsed():
@@ -150,13 +155,35 @@ SAMPLE_EML = f"From: sender@example.test\r\nTo: {GMAIL_USER}\r\nDate: {SAMPLE_DA
 
 
 class FakeIMAP:
-    """Stands in for imaplib.IMAP4_SSL: a context manager that records calls."""
+    """Stands in for imaplib.IMAP4_SSL: a context manager that records calls.
 
-    def __init__(self, status=STATUS_OK, data=None):
+    Covers the four commands the uploader issues - login, append, select and
+    uid - plus response(), which is how imaplib hands back the UIDVALIDITY that
+    SELECT reported.
+    """
+
+    def __init__(
+        self,
+        status=STATUS_OK,
+        data=None,
+        select_status=STATUS_OK,
+        uidvalidity=OBSERVED_UIDVALIDITY,
+        store_status=STATUS_OK,
+        search_status=STATUS_OK,
+        search_uids=(),
+    ):
         self.status = status
         self.data = [b"(Success)"] if data is None else data
+        self.select_status = select_status
+        self.uidvalidity = uidvalidity
+        self.store_status = store_status
+        self.search_status = search_status
+        self.search_uids = search_uids
         self.credentials = None
         self.appends = []
+        self.selects = []
+        self.stores = []
+        self.searches = []
         self.exited = False
 
     def __enter__(self):
@@ -173,6 +200,25 @@ class FakeIMAP:
             {"mailbox": mailbox, "flags": flags, "date_time": date_time, "message": message}
         )
         return self.status, self.data
+
+    def select(self, mailbox):
+        self.selects.append(mailbox)
+        return self.select_status, [b"1"]
+
+    def response(self, code):
+        """imaplib pops the cached untagged response; [None] when there was none."""
+        if code == UIDVALIDITY_CODE and self.uidvalidity is not None:
+            return code, [str(self.uidvalidity).encode()]
+        return code, [None]
+
+    def uid(self, command, *args):
+        if command.upper() == "STORE":
+            self.stores.append(args)
+            return self.store_status, [b"1 (X-GM-LABELS (...) UID 1)"]
+        if command.upper() == "SEARCH":
+            self.searches.append(args)
+            return self.search_status, [" ".join(str(u) for u in self.search_uids).encode()]
+        raise AssertionError(f"unexpected uid command {command}")
 
 
 def make_factory(fake):
@@ -213,14 +259,14 @@ def test_upload_appends_the_message_bytes(eml_bytes):
 def test_upload_returns_the_uid_of_the_message_it_appended(eml_bytes):
     """The point of parsing it: the caller can act on the message just stored."""
     fake = FakeIMAP(data=OBSERVED_APPEND_DATA)
-    assert upload(eml_bytes, fake) == (596438452, 165852)
+    assert upload(eml_bytes, fake).appenduid == (OBSERVED_UIDVALIDITY, OBSERVED_UID)
 
 
 def test_upload_succeeds_when_the_server_omits_the_uid(eml_bytes):
     """No UID is not a failure - it only means the message cannot be acted on
     without searching for it."""
     fake = FakeIMAP(data=[b"(Success)"])
-    assert upload(eml_bytes, fake) is None
+    assert upload(eml_bytes, fake).appenduid is None
     assert fake.appends
 
 
@@ -601,3 +647,295 @@ def test_the_rule_works_on_a_message_parsed_from_raw_bytes():
     it will actually be given."""
     raw = b"X-Original-To: alias@example.test\r\nTo: list@example.test\r\nSubject: hi\r\n\r\nbody\r\n"
     assert upload_eml.label_for_message(email.message_from_bytes(raw)) == "to/example.test/alias"
+
+
+# --- writing the label onto the message that was just appended --------------
+#
+# The label is applied over the same connection, immediately after the APPEND,
+# using the UID gmail reported. Everything here is subordinate to one rule: the
+# message is already delivered by the time any of this runs, so no failure in it
+# may be reported as an upload failure.
+
+EXPECTED_LABEL = "to/example.test/alias"
+OPAQUE_EML = (
+    "X-Original-To: alias@example.test\r\n"
+    "From: sender@example.test\r\n"
+    "To: list@example.test\r\n"
+    f"Date: {SAMPLE_DATE}\r\n"
+    "Message-ID: <abc123@example.test>\r\n"
+    "Subject: hi\r\n\r\nbody\r\n"
+)
+OPAQUE_MESSAGE_ID = "<abc123@example.test>"
+SEARCHED_UID = 4242
+
+
+@pytest.fixture
+def opaque_bytes():
+    """A message whose alias is in no header a human reads - so it gets a label."""
+    return OPAQUE_EML.encode()
+
+
+# --- quoting, which is what stops a label from ending the IMAP command early ---
+
+
+def test_a_value_is_wrapped_in_double_quotes():
+    assert upload_eml.imap_quote("plain") == '"plain"'
+
+
+def test_an_embedded_double_quote_is_escaped():
+    """Unescaped, gmail reads it as the end of the string and answers BAD."""
+    assert upload_eml.imap_quote('a"b') == '"a\\"b"'
+
+
+def test_a_backslash_is_escaped_before_the_quotes_are():
+    r"""Escaping in the other order would turn \ into \\\ and corrupt the value."""
+    assert upload_eml.imap_quote("a\\b") == '"a\\\\b"'
+
+
+def test_the_store_argument_is_a_parenthesised_quoted_list():
+    assert upload_eml.label_store_argument(EXPECTED_LABEL) == f'("{EXPECTED_LABEL}")'
+
+
+def test_a_quote_inside_a_label_cannot_close_the_list_early():
+    argument = upload_eml.label_store_argument('to/example.test/a"b')
+    assert argument.endswith('")') and argument.count('\\"') == 1
+
+
+# --- the fallback search, for when gmail omits APPENDUID ---
+
+
+def test_the_query_names_the_message_by_its_id():
+    assert upload_eml.rfc822msgid_query(OPAQUE_MESSAGE_ID) == "rfc822msgid:abc123@example.test"
+
+
+def test_the_angle_brackets_are_stripped():
+    """Gmail's operator takes the bare id; the brackets are RFC 5322 syntax."""
+    assert "<" not in upload_eml.rfc822msgid_query(OPAQUE_MESSAGE_ID)
+
+
+def test_surrounding_whitespace_is_ignored():
+    assert upload_eml.rfc822msgid_query("  <abc123@example.test>  ") == (
+        "rfc822msgid:abc123@example.test"
+    )
+
+
+def test_a_missing_message_id_yields_no_query():
+    assert upload_eml.rfc822msgid_query(None) is None
+
+
+def test_an_empty_message_id_yields_no_query():
+    assert upload_eml.rfc822msgid_query("<>") is None
+
+
+def test_a_non_ascii_message_id_yields_no_query():
+    """imaplib encodes the command line as ASCII, so this would raise instead of
+    searching. Better no label than an exception in the delivery path."""
+    assert upload_eml.rfc822msgid_query("<für@example.test>") is None
+
+
+def test_search_uids_are_parsed():
+    assert upload_eml.parse_search_uids([b"1 2 3"]) == [1, 2, 3]
+
+
+def test_no_search_hits_parses_to_nothing():
+    assert upload_eml.parse_search_uids([b""]) == []
+
+
+def test_search_data_of_none_parses_to_nothing():
+    assert upload_eml.parse_search_uids([None]) == []
+    assert upload_eml.parse_search_uids(None) == []
+
+
+def test_search_uids_given_as_str_are_parsed_too():
+    assert upload_eml.parse_search_uids(["7"]) == [7]
+
+
+def test_unparseable_search_tokens_are_dropped_not_raised():
+    assert upload_eml.parse_search_uids([b"1 nonsense 3"]) == [1, 3]
+
+
+# --- applying the label over the connection ---
+
+
+# Distinguishes "the caller said nothing" from "the caller said there is no uid",
+# which is the case the search fallback exists for.
+UNSPECIFIED = object()
+
+
+def apply(fake, label=EXPECTED_LABEL, appenduid=UNSPECIFIED, message_id=OPAQUE_MESSAGE_ID):
+    if appenduid is UNSPECIFIED:
+        appenduid = upload_eml.AppendUid(OBSERVED_UIDVALIDITY, OBSERVED_UID)
+    return upload_eml.apply_label(fake, SCRATCH_MAILBOX, label, appenduid, message_id)
+
+
+def test_the_mailbox_is_selected_before_the_store():
+    """STORE is only valid in the selected state - APPEND alone does not select."""
+    fake = FakeIMAP()
+    apply(fake)
+    assert fake.selects == [SCRATCH_MAILBOX]
+
+
+def test_the_label_is_stored_on_the_appended_uid():
+    fake = FakeIMAP()
+    apply(fake)
+    assert fake.stores == [(str(OBSERVED_UID), "+X-GM-LABELS", f'("{EXPECTED_LABEL}")')]
+
+
+def test_a_stored_label_reports_success():
+    assert apply(FakeIMAP()) is True
+
+
+def test_a_refused_store_reports_failure_rather_than_raising():
+    assert apply(FakeIMAP(store_status=STATUS_NO)) is False
+
+
+def test_a_refused_select_stores_nothing():
+    fake = FakeIMAP(select_status=STATUS_NO)
+    assert apply(fake) is False
+    assert fake.stores == []
+
+
+def test_no_search_is_needed_when_gmail_reported_the_uid():
+    """The whole point of APPENDUID: the happy path is one round trip, not two."""
+    fake = FakeIMAP()
+    apply(fake)
+    assert fake.searches == []
+
+
+# --- the UIDVALIDITY guard ---
+
+
+def test_a_uidvalidity_mismatch_does_not_store_on_the_reported_uid():
+    """A UID means nothing without its mailbox's UIDVALIDITY - and this account
+    really does hand out different ones per mailbox (INBOX ...452, Trash ...453).
+    Storing anyway would label whichever message now holds that number."""
+    fake = FakeIMAP(uidvalidity=OBSERVED_UIDVALIDITY + 1, search_uids=(SEARCHED_UID,))
+    apply(fake)
+    assert fake.stores == [(str(SEARCHED_UID), "+X-GM-LABELS", f'("{EXPECTED_LABEL}")')]
+
+
+def test_a_uidvalidity_mismatch_falls_back_to_the_search():
+    fake = FakeIMAP(uidvalidity=OBSERVED_UIDVALIDITY + 1, search_uids=(SEARCHED_UID,))
+    assert apply(fake) is True
+    assert fake.searches
+
+
+def test_an_unreported_uidvalidity_is_not_treated_as_a_mismatch():
+    """SELECT is required to report it, so absence means an unusual server rather
+    than a changed mailbox - and nothing was learned that argues against the UID."""
+    fake = FakeIMAP(uidvalidity=None)
+    apply(fake)
+    assert fake.stores and fake.searches == []
+
+
+# --- the search fallback in use ---
+
+
+def test_a_missing_appenduid_searches_for_the_message():
+    fake = FakeIMAP(search_uids=(SEARCHED_UID,))
+    apply(fake, appenduid=None)
+    assert fake.searches == [(None, "X-GM-RAW", '"rfc822msgid:abc123@example.test"')]
+
+
+def test_the_searched_uid_is_the_one_labelled():
+    fake = FakeIMAP(search_uids=(SEARCHED_UID,))
+    apply(fake, appenduid=None)
+    assert fake.stores == [(str(SEARCHED_UID), "+X-GM-LABELS", f'("{EXPECTED_LABEL}")')]
+
+
+def test_a_search_finding_nothing_stores_nothing():
+    fake = FakeIMAP(search_uids=())
+    assert apply(fake, appenduid=None) is False
+    assert fake.stores == []
+
+
+def test_an_ambiguous_search_stores_nothing():
+    """Message-ID should be unique and gmail dedupes on it, so several hits mean
+    the assumption broke - labelling one at random would be a guess."""
+    fake = FakeIMAP(search_uids=(SEARCHED_UID, SEARCHED_UID + 1))
+    assert apply(fake, appenduid=None) is False
+    assert fake.stores == []
+
+
+def test_a_refused_search_stores_nothing():
+    fake = FakeIMAP(search_status=STATUS_NO, search_uids=(SEARCHED_UID,))
+    assert apply(fake, appenduid=None) is False
+    assert fake.stores == []
+
+
+def test_no_uid_and_no_message_id_stores_nothing():
+    fake = FakeIMAP()
+    assert apply(fake, appenduid=None, message_id=None) is False
+    assert fake.stores == []
+
+
+# --- wired into the upload ---
+
+
+def test_an_opaque_message_is_labelled_by_the_upload(opaque_bytes):
+    fake = FakeIMAP(data=OBSERVED_APPEND_DATA)
+    upload(opaque_bytes, fake)
+    assert fake.stores == [(str(OBSERVED_UID), "+X-GM-LABELS", f'("{EXPECTED_LABEL}")')]
+
+
+def test_the_result_says_what_was_applied(opaque_bytes):
+    fake = FakeIMAP(data=OBSERVED_APPEND_DATA)
+    result = upload(opaque_bytes, fake)
+    assert result.label == EXPECTED_LABEL
+    assert result.labelled is True
+    assert result.appenduid == (OBSERVED_UIDVALIDITY, OBSERVED_UID)
+
+
+def test_a_message_needing_no_label_costs_no_extra_round_trip(eml_bytes):
+    """The rule skips ~7 in 8 messages; those must not pay a SELECT for nothing."""
+    fake = FakeIMAP(data=OBSERVED_APPEND_DATA)
+    result = upload(eml_bytes, fake)
+    assert fake.selects == [] and fake.stores == []
+    assert result.label is None and result.labelled is False
+
+
+def test_labelling_can_be_switched_off(opaque_bytes):
+    """An escape hatch that does not need a redeploy, matching --no-spool."""
+    fake = FakeIMAP(data=OBSERVED_APPEND_DATA)
+    result = upload_eml.upload_eml_to_gmail(
+        opaque_bytes,
+        GMAIL_USER,
+        APP_PASSWORD,
+        SCRATCH_MAILBOX,
+        imap_factory=make_factory(fake),
+        apply_labels=False,
+    )
+    assert fake.selects == [] and result.labelled is False
+
+
+def test_a_refused_label_still_reports_a_successful_upload(opaque_bytes):
+    """The message is in gmail. A missing label is not worth a Program failure
+    line, and spooling it would re-upload a message that already arrived."""
+    fake = FakeIMAP(data=OBSERVED_APPEND_DATA, store_status=STATUS_NO)
+    result = upload(opaque_bytes, fake)
+    assert result.labelled is False
+    assert result.appenduid == (OBSERVED_UIDVALIDITY, OBSERVED_UID)
+
+
+class ExplodingLabelIMAP(FakeIMAP):
+    """A connection that fails on everything the labelling step touches."""
+
+    def select(self, mailbox):
+        raise TimeoutError("timed out")
+
+
+def test_an_exploding_label_step_does_not_fail_the_upload(opaque_bytes):
+    """Even a timeout here: the APPEND already succeeded, so raising would turn a
+    delivered message into a reported failure."""
+    fake = ExplodingLabelIMAP(data=OBSERVED_APPEND_DATA)
+    result = upload(opaque_bytes, fake)
+    assert result.labelled is False
+    assert result.appenduid == (OBSERVED_UIDVALIDITY, OBSERVED_UID)
+
+
+def test_a_refused_append_is_still_an_error_and_labels_nothing(opaque_bytes):
+    """Labelling must not soften the one failure that does matter."""
+    fake = FakeIMAP(status=STATUS_NO, data=[b"[OVERQUOTA] Not enough storage space"])
+    with pytest.raises(upload_eml.AppendError):
+        upload(opaque_bytes, fake)
+    assert fake.selects == [] and fake.stores == []

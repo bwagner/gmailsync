@@ -50,6 +50,32 @@ the end of `.procmailrc` is delivered by procmail's `$DEFAULT` fallback, so
 local delivery already happens. An explicit recipe would stop processing at
 that point, and any recipe below it would never run.
 
+## Labels: which alias the message was addressed to
+
+If one mailbox is reached through many aliases - a different address per
+correspondent - the alias that was used is worth knowing, because it names
+whoever gave your address away. The forwarder records it in `X-Original-To`,
+but Gmail never sees that header: it is fed by this script's `APPEND` rather
+than by SMTP, so it has nothing to index and no filter of yours can key on it.
+
+So `upload_eml.py` reads the header itself and applies a nested label at upload
+time, `alias@example.test` becoming `to/example.test/alias`. Domain first, so
+the sidebar groups every alias of one domain together. The label is created on
+first use; there is nothing to set up.
+
+**Only messages whose alias is not already visible get one.** If the address
+appears in `To:` or `Cc:` the reading pane already shows it and a label would
+be noise - on a real sample that is about seven messages in eight. What is left
+is the case worth seeing: bcc'd mail, mailing lists, and spam, where `To:` says
+something unrelated and the alias survives nowhere else.
+
+Labelling happens over the same connection, straight after the append, using
+the UID Gmail reports back. **It can never fail an upload.** By the time it
+runs the message is already delivered, so a refusal, a stall, or anything else
+unexpected costs the label and nothing more - it is not worth a
+`Program failure` line for a message that arrived. Pass `--no-label` to switch
+it off without redeploying.
+
 ## Testing Upload to Gmail
 
 ```bash
