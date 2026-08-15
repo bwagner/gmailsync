@@ -13,6 +13,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import NamedTuple
 
 CONFIG_PATH = Path.home() / ".config" / "mailsync" / "config"
 
@@ -32,6 +33,19 @@ IMAP_TIMEOUT_SECONDS = 60
 
 # IMAP4 tagged-response status meaning the server accepted the command (RFC 3501).
 STATUS_OK = "OK"
+
+# RFC 4315: the tagged OK of an APPEND may carry [APPENDUID <uidvalidity> <uid>],
+# naming the message that was just stored. Only a single uid is accepted here -
+# the RFC also permits a uid-set for MULTIAPPEND, which this program never
+# issues, so a set means an assumption broke and nothing should be returned.
+APPENDUID_PATTERN = re.compile(r"\[APPENDUID\s+(\d+)\s+(\d+)\s*\]", re.IGNORECASE)
+
+
+class AppendUid(NamedTuple):
+    """Where a just-appended message landed, so it can be acted on directly."""
+
+    uidvalidity: int
+    uid: int
 
 
 class AppendError(Exception):
@@ -65,6 +79,20 @@ def _describe(data: list | None) -> str:
             continue
         parts.append(item.decode(errors="replace") if isinstance(item, bytes) else str(item))
     return " ".join(parts)
+
+
+def parse_appenduid(data: list | None) -> AppendUid | None:
+    """The UID gmail assigned to a just-appended message, if it said.
+
+    Gmail returns APPENDUID **without advertising UIDPLUS**, so this is observed
+    behaviour rather than a contract: every failure to find or parse it returns
+    None. The caller's fallback is to search for the message by Message-ID; a
+    missing UID is not an upload failure and must never be treated as one.
+    """
+    match = APPENDUID_PATTERN.search(_describe(data))
+    if match is None:
+        return None
+    return AppendUid(int(match.group(1)), int(match.group(2)))
 
 
 def check_append_result(typ: str, data: list | None) -> None:
@@ -111,7 +139,8 @@ def spool_failed(eml: bytes, pending_dir: Path = PENDING_DIR) -> Path:
     return final
 
 
-def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox: str = "INBOX", imap_factory=imaplib.IMAP4_SSL, timeout: int = IMAP_TIMEOUT_SECONDS) -> None:
+def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox: str = "INBOX", imap_factory=imaplib.IMAP4_SSL, timeout: int = IMAP_TIMEOUT_SECONDS) -> AppendUid | None:
+    """Append the message to gmail, returning where it landed if gmail said."""
     msg = email.message_from_bytes(eml)
     date_str = msg.get("Date")
     if date_str:
@@ -124,6 +153,7 @@ def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox:
         typ, data = imap.append(mailbox, None, imaplib.Time2Internaldate(timestamp), eml)
         print(f"Result: {typ} {_describe(data)}".rstrip())
         check_append_result(typ, data)
+        return parse_appenduid(data)
 
 
 if __name__ == "__main__":

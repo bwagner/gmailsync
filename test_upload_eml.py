@@ -74,6 +74,70 @@ def test_multipart_data_is_joined():
     assert "first" in message and "second" in message
 
 
+# --- the APPENDUID gmail returns on a successful APPEND ---------------------
+#
+# Needed to act on the message just uploaded - labelling it with the alias it
+# was addressed to - without a second round trip to find it again. Gmail returns
+# it despite NOT advertising UIDPLUS, so it is observed behaviour and not a
+# contract: every case where it is missing or unparseable must yield None rather
+# than raise, and the caller must still treat the upload as successful.
+
+# Verbatim from a real gmail APPEND to INBOX, observed 2026-08-13.
+OBSERVED_APPEND_DATA = [b"[APPENDUID 596438452 165852] (Success)"]
+
+
+def test_the_observed_gmail_response_is_parsed():
+    assert upload_eml.parse_appenduid(OBSERVED_APPEND_DATA) == (596438452, 165852)
+
+
+def test_the_parsed_parts_are_named_and_numeric():
+    result = upload_eml.parse_appenduid(OBSERVED_APPEND_DATA)
+    assert result.uidvalidity == 596438452
+    assert result.uid == 165852
+
+
+def test_a_response_without_appenduid_yields_none():
+    """Gmail does not advertise UIDPLUS, so it owes us nothing."""
+    assert upload_eml.parse_appenduid([b"(Success)"]) is None
+
+
+def test_no_response_data_at_all_yields_none():
+    assert upload_eml.parse_appenduid(None) is None
+
+
+def test_empty_response_data_yields_none():
+    assert upload_eml.parse_appenduid([]) is None
+
+
+def test_a_none_inside_the_response_data_is_skipped():
+    assert upload_eml.parse_appenduid([None, b"[APPENDUID 1 2]"]) == (1, 2)
+
+
+def test_str_response_items_are_parsed_too():
+    """imaplib hands back bytes, but nothing in its contract promises that."""
+    assert upload_eml.parse_appenduid(["[APPENDUID 1 2] (Success)"]) == (1, 2)
+
+
+def test_the_code_is_recognised_case_insensitively():
+    assert upload_eml.parse_appenduid([b"[appenduid 1 2] (Success)"]) == (1, 2)
+
+
+def test_a_uid_set_is_not_guessed_at():
+    """RFC 4315 permits a uid-set here for MULTIAPPEND. This uploads one message
+    at a time, so a set means the assumption broke - return nothing rather than
+    pick a number and label the wrong message."""
+    assert upload_eml.parse_appenduid([b"[APPENDUID 596438452 3:5] (Success)"]) is None
+
+
+def test_a_malformed_code_yields_none():
+    assert upload_eml.parse_appenduid([b"[APPENDUID nonsense] (Success)"]) is None
+
+
+def test_undecodable_bytes_do_not_raise():
+    """A garbled response must not take down a message upload."""
+    assert upload_eml.parse_appenduid([b"\xff\xfe [APPENDUID 1 2]"]) == (1, 2)
+
+
 # --- wiring: upload_eml_to_gmail against an injected fake connection ---------
 
 GMAIL_USER = "someone@example.test"
@@ -142,6 +206,20 @@ def test_upload_appends_the_message_bytes(eml_bytes):
     fake = FakeIMAP()
     upload(eml_bytes, fake)
     assert fake.appends[0]["message"] == SAMPLE_EML.encode()
+
+
+def test_upload_returns_the_uid_of_the_message_it_appended(eml_bytes):
+    """The point of parsing it: the caller can act on the message just stored."""
+    fake = FakeIMAP(data=OBSERVED_APPEND_DATA)
+    assert upload(eml_bytes, fake) == (596438452, 165852)
+
+
+def test_upload_succeeds_when_the_server_omits_the_uid(eml_bytes):
+    """No UID is not a failure - it only means the message cannot be acted on
+    without searching for it."""
+    fake = FakeIMAP(data=[b"(Success)"])
+    assert upload(eml_bytes, fake) is None
+    assert fake.appends
 
 
 def test_upload_appends_to_the_requested_mailbox(eml_bytes):
