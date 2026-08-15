@@ -82,7 +82,14 @@ directory` before python starts.
 **`check_deployment.py`** - deployment is a manual copy, so nothing detects
 drift. This compares each file's committed, working-tree and deployed versions
 and names which pair disagrees. Host and file mapping come from a config file;
-`--example-config` prints a template. Exits nonzero if anything differs.
+`--example-config` prints a template.
+
+Exits 1 if anything differs and 2 if the host could not be reached. Those are
+separate because they call for different responses - one is something to go and
+fix, the other is something to retry - and because reporting an unreachable
+host as "every file is missing on the server" is indistinguishable from someone
+having deleted them all. The ssh call waits 10 seconds to connect and never
+prompts, so an unreachable host fails quickly rather than hanging.
 
 ## Tests
 

@@ -122,6 +122,110 @@ def test_a_failed_ssh_still_yields_what_it_could_read():
     assert cd.remote_digests("host.test", ["a", "b"], run) == {"a": DIGEST_A}
 
 
+def test_the_ssh_call_cannot_block_on_a_prompt():
+    """Meant to be runnable from cron, where nothing can answer a passphrase."""
+    captured = {}
+
+    def run(cmd, input=None):
+        captured["cmd"] = cmd
+        return 0, ""
+
+    cd.remote_digests("host.test", ["a"], run)
+    assert "BatchMode=yes" in captured["cmd"]
+
+
+def test_the_ssh_call_bounds_how_long_it_waits_to_connect():
+    captured = {}
+
+    def run(cmd, input=None):
+        captured["cmd"] = cmd
+        return 0, ""
+
+    cd.remote_digests("host.test", ["a"], run)
+    assert f"ConnectTimeout={cd.SSH_CONNECT_TIMEOUT_SECONDS}" in captured["cmd"]
+
+
+# --- an unreachable host is not a pile of missing files ---------------------
+#
+# The bug this replaces: ssh failing produced no digests at all, so every file
+# was classified MISSING_REMOTE - indistinguishable from someone having deleted
+# the lot. ssh(1): "ssh exits with the exit status of the remote command or with
+# 255 if an error occurred", so 255 is the transport failing and anything else
+# came from sha256sum.
+
+
+def test_a_transport_failure_is_not_reported_as_missing_files():
+    def run(cmd, input=None):
+        return cd.SSH_FAILURE_CODE, "ssh: connect to host host.test port 22: Operation timed out\n"
+
+    with pytest.raises(cd.TransportError):
+        cd.remote_digests("host.test", ["a", "b"], run)
+
+
+def test_the_transport_failure_carries_ssh_s_own_message():
+    """Timed out, refused and no-such-host are different problems."""
+    def run(cmd, input=None):
+        return cd.SSH_FAILURE_CODE, "ssh: Could not resolve hostname host.test\n"
+
+    with pytest.raises(cd.TransportError) as caught:
+        cd.remote_digests("host.test", ["a"], run)
+    assert "Could not resolve hostname" in str(caught.value)
+
+
+def test_a_missing_digest_command_is_a_transport_failure_too():
+    """127 is either ssh missing here or sha256sum missing there. Either way
+    nothing was learned about the remote files."""
+    def run(cmd, input=None):
+        return cd.COMMAND_NOT_FOUND_CODE, "bash: sha256sum: command not found\n"
+
+    with pytest.raises(cd.TransportError):
+        cd.remote_digests("host.test", ["a"], run)
+
+
+def test_a_local_ssh_that_cannot_be_started_is_a_transport_failure():
+    """run_command reports an unstartable command as 127, so it lands here and
+    not on the files."""
+    code, _ = cd.run_command(["definitely-not-a-command-xyzzy"])
+    assert code == cd.COMMAND_NOT_FOUND_CODE
+
+
+def test_an_unreachable_host_marks_every_file_unreachable():
+    def run(cmd, input=None):
+        if cmd[0] == cd.SSH:
+            return cd.SSH_FAILURE_CODE, "ssh: connect to host: Operation timed out\n"
+        return 1, ""
+
+    results = cd.check("host.test", {"a.py": "bin/a.py", "b.py": "bin/b.py"}, run)
+    assert [r["verdict"] for r in results] == [cd.UNREACHABLE, cd.UNREACHABLE]
+
+
+def test_an_unreachable_host_reports_why():
+    def run(cmd, input=None):
+        if cmd[0] == cd.SSH:
+            return cd.SSH_FAILURE_CODE, "ssh: Could not resolve hostname host.test\n"
+        return 1, ""
+
+    results = cd.check("host.test", {"a.py": "bin/a.py"}, run)
+    assert "Could not resolve hostname" in results[0]["error"]
+
+
+def test_an_unreachable_host_still_reports_the_local_side():
+    """What is committed and what is in the tree are known regardless of the
+    server, and are worth seeing."""
+    def run(cmd, input=None):
+        if cmd[0] == cd.SSH:
+            return cd.SSH_FAILURE_CODE, "ssh: Operation timed out\n"
+        return 1, ""
+
+    results = cd.check("host.test", {"check_deployment.py": "bin/check_deployment.py"}, run)
+    assert results[0]["work"] is not None
+    assert results[0]["deployed"] is None
+
+
+def test_unreachable_is_not_a_clean_verdict():
+    assert not cd.is_clean(cd.UNREACHABLE)
+
+
 # --- configuration ----------------------------------------------------------
 
 
@@ -198,3 +302,19 @@ def test_exit_status_is_nonzero_on_any_drift():
 def test_exit_status_is_nonzero_when_nothing_was_checked():
     """An empty run must not look like a pass."""
     assert cd.exit_status([]) != 0
+
+
+def test_an_unreachable_host_exits_differently_from_a_disagreement():
+    """"go and fix something" and "try again later" are different answers, and
+    a caller should not have to parse the output to tell them apart."""
+    assert cd.exit_status([cd.UNREACHABLE]) != cd.exit_status([cd.UNDEPLOYED])
+
+
+def test_an_unreachable_host_exits_with_the_cannot_check_code():
+    assert cd.exit_status([cd.UNREACHABLE, cd.UNREACHABLE]) == cd.EXIT_CANNOT_CHECK
+
+
+def test_a_disagreement_outranks_nothing_when_the_host_is_unreachable():
+    """Every file is unreachable or none is - there is one ssh call - so a mixed
+    list means the code changed underneath this assumption."""
+    assert cd.exit_status([cd.OK, cd.UNREACHABLE]) == cd.EXIT_CANNOT_CHECK
