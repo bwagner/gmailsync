@@ -318,3 +318,145 @@ def test_a_disagreement_outranks_nothing_when_the_host_is_unreachable():
     """Every file is unreachable or none is - there is one ssh call - so a mixed
     list means the code changed underneath this assumption."""
     assert cd.exit_status([cd.OK, cd.UNREACHABLE]) == cd.EXIT_CANNOT_CHECK
+
+
+# --- does the deployed copy actually import? --------------------------------
+#
+# Digests prove the right bytes are on the server; they say nothing about
+# whether those bytes run there. The mac is on python 3.14 and the server on
+# 3.12, which evaluate annotations differently (PEP 649), so a file that imports
+# here can fail to import there - and for a script procmail invokes per
+# delivery, that is every upload dying at startup. The local test suite cannot
+# catch it: pytest imports email.message itself and masks exactly this class of
+# missing-submodule bug, at any version. Only a bare import does.
+
+PY_FILE = "bin/one.py"
+OTHER_PY_FILE = "bin/two.py"
+NOT_PY_FILE = ".procmailrc"
+
+
+def import_runner(results, digests=None):
+    """A fake run() answering both the digest call and the import call."""
+    digests = digests or {}
+    calls = []
+
+    def run(cmd, input=None):
+        calls.append({"cmd": cmd, "input": input})
+        if cd.REMOTE_DIGEST_COMMAND in cmd:
+            return 0, "".join(f"{d}  {p}\n" for p, d in digests.items())
+        if cd.REMOTE_PYTHON in cmd:
+            import json
+            return 0, json.dumps(results)
+        return 0, ""
+
+    run.calls = calls
+    return run
+
+
+def test_only_python_files_are_import_checked():
+    """.procmailrc is in the same mapping and is not python."""
+    run = import_runner({PY_FILE: None})
+    cd.check("host.test", {"a.py": PY_FILE, "rc": NOT_PY_FILE}, run)
+    program = next(c["input"] for c in run.calls if cd.REMOTE_PYTHON in c["cmd"])
+    assert PY_FILE in program.decode()
+    assert NOT_PY_FILE not in program.decode()
+
+
+def test_the_import_check_is_one_round_trip():
+    run = import_runner({PY_FILE: None, OTHER_PY_FILE: None})
+    cd.check("host.test", {"a.py": PY_FILE, "b.py": OTHER_PY_FILE}, run)
+    assert len([c for c in run.calls if cd.REMOTE_PYTHON in c["cmd"]]) == 1
+
+
+def test_a_file_that_imports_keeps_its_digest_verdict():
+    run = import_runner({PY_FILE: None})
+    results = cd.check("host.test", {"a.py": PY_FILE}, run)
+    assert results[0]["verdict"] != cd.IMPORT_FAILED
+
+
+def test_a_file_that_does_not_import_is_reported():
+    run = import_runner({PY_FILE: "AttributeError: module 'email' has no attribute 'message'"})
+    results = cd.check("host.test", {"a.py": PY_FILE}, run)
+    assert results[0]["verdict"] == cd.IMPORT_FAILED
+
+
+def test_the_import_failure_carries_the_error():
+    """Which import broke is the whole diagnostic value."""
+    run = import_runner({PY_FILE: "AttributeError: module 'email' has no attribute 'message'"})
+    results = cd.check("host.test", {"a.py": PY_FILE}, run)
+    assert "no attribute 'message'" in results[0]["error"]
+
+
+def test_an_import_failure_outranks_a_clean_digest():
+    """In sync and unrunnable is the worst case there is - reporting 'ok'
+    because the bytes match would be actively misleading."""
+    digest = DIGEST_A
+    run = import_runner({PY_FILE: "SyntaxError: bad"}, digests={PY_FILE: digest})
+    results = cd.check("host.test", {"a.py": PY_FILE}, run)
+    assert results[0]["verdict"] == cd.IMPORT_FAILED
+
+
+def test_import_failed_is_not_a_clean_verdict():
+    assert not cd.is_clean(cd.IMPORT_FAILED)
+
+
+def test_the_import_check_can_be_skipped():
+    run = import_runner({PY_FILE: None})
+    cd.check("host.test", {"a.py": PY_FILE}, run, import_check=False)
+    assert not [c for c in run.calls if cd.REMOTE_PYTHON in c["cmd"]]
+
+
+def test_a_transport_failure_during_the_import_check_is_not_an_import_failure():
+    """A dead connection must not be reported as broken code."""
+    def run(cmd, input=None):
+        if cd.REMOTE_PYTHON in cmd:
+            return cd.SSH_FAILURE_CODE, "ssh: Operation timed out\n"
+        if cd.REMOTE_DIGEST_COMMAND in cmd:
+            return 0, ""
+        return 0, ""
+
+    results = cd.check("host.test", {"a.py": PY_FILE}, run)
+    assert results[0]["verdict"] == cd.UNREACHABLE
+
+
+def test_unparseable_import_output_is_not_read_as_success():
+    """Silence or noise from the remote must not look like 'everything imports'."""
+    def run(cmd, input=None):
+        if cd.REMOTE_PYTHON in cmd:
+            return 0, "bash: python3: command not found\n"
+        return 0, ""
+
+    results = cd.check("host.test", {"a.py": PY_FILE}, run)
+    assert results[0]["verdict"] == cd.IMPORT_FAILED
+
+
+def test_the_program_sets_up_the_path_for_sibling_imports():
+    """mailsync_housekeeping.py imports upload_eml from its own directory."""
+    program = cd.import_check_program([PY_FILE]).decode()
+    assert "sys.path" in program
+
+
+def test_the_program_is_sent_on_stdin_not_as_an_argument():
+    """Paths and quoting never reach a remote shell that way."""
+    run = import_runner({PY_FILE: None})
+    cd.check("host.test", {"a.py": PY_FILE}, run)
+    call = next(c for c in run.calls if cd.REMOTE_PYTHON in c["cmd"])
+    assert call["input"] is not None
+    assert PY_FILE not in " ".join(call["cmd"])
+
+
+# --- exit status for an unrunnable deployment -------------------------------
+
+
+def test_an_import_failure_has_its_own_exit_code():
+    assert cd.exit_status([cd.IMPORT_FAILED]) == cd.EXIT_CANNOT_RUN
+
+
+def test_an_import_failure_outranks_a_disagreement():
+    """Broken in production beats out of date."""
+    assert cd.exit_status([cd.UNDEPLOYED, cd.IMPORT_FAILED]) == cd.EXIT_CANNOT_RUN
+
+
+def test_being_unreachable_outranks_an_import_failure():
+    """With no answer from the host nothing was established, including this."""
+    assert cd.exit_status([cd.IMPORT_FAILED, cd.UNREACHABLE]) == cd.EXIT_CANNOT_CHECK

@@ -84,12 +84,29 @@ drift. This compares each file's committed, working-tree and deployed versions
 and names which pair disagrees. Host and file mapping come from a config file;
 `--example-config` prints a template.
 
-Exits 1 if anything differs and 2 if the host could not be reached. Those are
-separate because they call for different responses - one is something to go and
-fix, the other is something to retry - and because reporting an unreachable
-host as "every file is missing on the server" is indistinguishable from someone
-having deleted them all. The ssh call waits 10 seconds to connect and never
-prompts, so an unreachable host fails quickly rather than hanging.
+It also **imports each deployed python file on the server**, because matching
+digests only prove the right bytes arrived, not that they run there. If the
+machine you develop on has a different python than the server, a file can import
+cleanly for you and fail on the server - and a local test suite will not catch
+it, since pytest imports much of the stdlib itself and masks missing submodule
+imports. For a script that runs inside mail delivery, that failure is every
+message failing to upload. `--no-import-check` skips it.
+
+Exit codes are distinct because the responses differ - one is something to go
+and fix, one is something to retry, one is an outage:
+
+| code | meaning |
+|---|---|
+| 0 | everything matches and imports |
+| 1 | some file disagrees |
+| 2 | the host could not be reached, so nothing was compared |
+| 3 | a deployed file is in place but does not import there |
+
+Reporting an unreachable host as "every file is missing on the server" would be
+indistinguishable from someone having deleted them all, so a transport failure
+is its own verdict rather than a per-file one. The ssh call waits 10 seconds to
+connect and never prompts, so an unreachable host fails quickly rather than
+hanging.
 
 ## Tests
 
