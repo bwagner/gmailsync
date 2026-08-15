@@ -7,6 +7,8 @@ upload_eml.py is stdlib-only and deployed by copying a single file - so pytest
 is supplied at run time by uv rather than declared as a project dependency.
 """
 
+import email
+
 import pytest
 
 import upload_eml
@@ -419,3 +421,183 @@ def test_spooled_files_are_discoverable_by_suffix(tmp_path):
     """The retry pass globs for this suffix; it has to match what is written."""
     path = upload_eml.spool_failed(b"x", tmp_path)
     assert path.suffix == upload_eml.SPOOL_SUFFIX
+
+
+# --- the alias a message was addressed to, and the label for it -------------
+#
+# Mail reaches one mailbox through many aliases, one per correspondent, and the
+# alias survives only in X-Original-To. Gmail is fed by our own APPEND rather
+# than by SMTP, so it never sees that header - which is why the label has to be
+# computed here. Rule and its two divergences are recorded in decisions.md,
+# 2026-08-15 19:04 for the two places this deliberately diverges from it.
+
+
+def message(**headers):
+    """Build a message from headers alone; the body is irrelevant to the rule."""
+    raw = "".join(f"{name.replace('_', '-')}: {value}\r\n" for name, value in headers.items())
+    return email.message_from_string(raw + "\r\n")
+
+
+# --- extracting the alias ---
+
+
+def test_the_alias_comes_from_x_original_to():
+    msg = message(X_Original_To="alias@example.test", To="someone@example.test")
+    assert upload_eml.alias_from_headers(msg) == "alias@example.test"
+
+
+def test_envelope_to_is_the_fallback():
+    msg = message(Envelope_To="alias@example.test")
+    assert upload_eml.alias_from_headers(msg) == "alias@example.test"
+
+
+def test_x_original_to_wins_over_envelope_to():
+    msg = message(X_Original_To="first@example.test", Envelope_To="second@example.test")
+    assert upload_eml.alias_from_headers(msg) == "first@example.test"
+
+
+def test_delivered_to_is_not_an_alias_source():
+    """It holds the final hop - the real mailbox - not the alias. Using it would
+    label ordinary mail with the destination it already has in common."""
+    msg = message(Delivered_To="realmailbox@example.test")
+    assert upload_eml.alias_from_headers(msg) is None
+
+
+def test_the_to_header_is_not_an_alias_source():
+    """It lies on exactly the bcc and list mail this feature exists to identify,
+    and where it is truthful the alias is visible anyway."""
+    msg = message(To="alias@example.test")
+    assert upload_eml.alias_from_headers(msg) is None
+
+
+def test_a_display_name_is_stripped_from_the_alias():
+    msg = message(X_Original_To="Someone <alias@example.test>")
+    assert upload_eml.alias_from_headers(msg) == "alias@example.test"
+
+
+def test_the_alias_is_lowercased():
+    """Addresses differing only in case must not split into two gmail labels."""
+    msg = message(X_Original_To="ALIAS@Example.TEST")
+    assert upload_eml.alias_from_headers(msg) == "alias@example.test"
+
+
+def test_a_message_with_no_recipient_headers_has_no_alias():
+    assert upload_eml.alias_from_headers(message(Subject="hi")) is None
+
+
+def test_a_value_that_is_not_an_address_is_ignored():
+    msg = message(X_Original_To="not-an-address")
+    assert upload_eml.alias_from_headers(msg) is None
+
+
+def test_a_later_header_is_used_when_the_first_is_unparseable():
+    msg = message(X_Original_To="garbage", Envelope_To="alias@example.test")
+    assert upload_eml.alias_from_headers(msg) == "alias@example.test"
+
+
+# --- mapping an alias to a label ---
+
+
+def test_the_label_puts_the_domain_before_the_localpart():
+    """Domain first so gmail's sidebar groups every alias of one domain."""
+    assert upload_eml.label_for_alias("alias@example.test") == "to/example.test/alias"
+
+
+def test_the_label_root_is_a_single_namespace():
+    assert upload_eml.label_for_alias("a@b.test").startswith(upload_eml.LABEL_ROOT + "/")
+
+
+def test_a_slash_in_the_address_cannot_invent_a_nesting_level():
+    """Gmail reads / as a level of nesting, so it cannot survive inside one
+    component of the label."""
+    assert "/" not in upload_eml.label_for_alias("a/b@c.test").removeprefix("to/c.test/")
+
+
+def test_an_address_without_an_at_sign_has_no_label():
+    assert upload_eml.label_for_alias("nonsense") is None
+
+
+def test_no_alias_means_no_label():
+    """Deliberately no to/unparsed catch-all: at upload time this should be
+    unreachable, and a catch-all label would only accumulate noise."""
+    assert upload_eml.label_for_alias(None) is None
+
+
+def test_an_empty_localpart_has_no_label():
+    assert upload_eml.label_for_alias("@example.test") is None
+
+
+def test_an_empty_domain_has_no_label():
+    assert upload_eml.label_for_alias("bw@") is None
+
+
+# --- is the alias already visible to a human? ---
+
+
+def test_an_alias_in_the_to_header_is_visible():
+    msg = message(X_Original_To="alias@example.test", To="alias@example.test")
+    assert upload_eml.alias_is_visible(msg, "alias@example.test")
+
+
+def test_an_alias_in_the_cc_header_is_visible():
+    msg = message(X_Original_To="alias@example.test", Cc="alias@example.test")
+    assert upload_eml.alias_is_visible(msg, "alias@example.test")
+
+
+def test_an_alias_among_several_recipients_is_still_visible():
+    msg = message(X_Original_To="alias@example.test", To="a@example.test, alias@example.test, b@example.test")
+    assert upload_eml.alias_is_visible(msg, "alias@example.test")
+
+
+def test_visibility_ignores_case():
+    msg = message(X_Original_To="alias@example.test", To="ALIAS@EXAMPLE.TEST")
+    assert upload_eml.alias_is_visible(msg, "alias@example.test")
+
+
+def test_an_alias_absent_from_to_and_cc_is_not_visible():
+    """The bcc / mailing-list case - the whole point of the feature."""
+    msg = message(X_Original_To="alias@example.test", To="list@example.test")
+    assert not upload_eml.alias_is_visible(msg, "alias@example.test")
+
+
+def test_a_bcc_header_does_not_count_as_visible():
+    """Bcc: is not shown to the recipient, and is normally stripped entirely."""
+    msg = message(X_Original_To="alias@example.test", Bcc="alias@example.test")
+    assert not upload_eml.alias_is_visible(msg, "alias@example.test")
+
+
+def test_nothing_is_visible_without_an_alias():
+    assert not upload_eml.alias_is_visible(message(To="a@example.test"), None)
+
+
+# --- the rule as a whole ---
+
+
+def test_an_opaque_message_gets_the_alias_label():
+    msg = message(X_Original_To="alias@example.test", To="list@example.test")
+    assert upload_eml.label_for_message(msg) == "to/example.test/alias"
+
+
+def test_a_message_that_already_shows_its_alias_gets_no_label():
+    """A label here would duplicate the reading pane and bury the interesting
+    messages. On a live sample only 4 of 26 were opaque."""
+    msg = message(X_Original_To="alias@example.test", To="alias@example.test")
+    assert upload_eml.label_for_message(msg) is None
+
+
+def test_a_message_with_no_alias_gets_no_label():
+    assert upload_eml.label_for_message(message(Subject="hi")) is None
+
+
+def test_only_the_alias_label_is_produced():
+    """No processed-marker label alongside it. A marker belongs to a tool with a
+    finite job, and this must not start producing one nothing will own later."""
+    msg = message(X_Original_To="alias@example.test", To="list@example.test")
+    assert upload_eml.label_for_message(msg).startswith(upload_eml.LABEL_ROOT + "/")
+
+
+def test_the_rule_works_on_a_message_parsed_from_raw_bytes():
+    """The uploader has bytes, not a Message - the rule must survive the parse
+    it will actually be given."""
+    raw = b"X-Original-To: alias@example.test\r\nTo: list@example.test\r\nSubject: hi\r\n\r\nbody\r\n"
+    assert upload_eml.label_for_message(email.message_from_bytes(raw)) == "to/example.test/alias"

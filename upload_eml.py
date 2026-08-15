@@ -6,6 +6,13 @@
 
 import configparser
 import email
+
+# Neither submodule is implied by `import email`. Both are named below - one in
+# an annotation - and the server's python 3.12 evaluates annotations eagerly, so
+# omitting these makes the module fail to import there while working on a 3.14
+# mac, where PEP 649 defers them.
+import email.message
+import email.utils
 import imaplib
 import os
 import re
@@ -46,6 +53,92 @@ class AppendUid(NamedTuple):
 
     uidvalidity: int
     uid: int
+
+
+# --- which alias this message was addressed to ------------------------------
+#
+# One mailbox is reached through many aliases, one per correspondent, and which
+# was used is the useful fact: it names whoever gave the address away. Postfix
+# records it in X-Original-To, and because gmail is fed by our own APPEND rather
+# than by SMTP it never sees that header - so the label has to be computed here.
+
+HEADER_X_ORIGINAL_TO = "X-Original-To"
+HEADER_ENVELOPE_TO = "Envelope-To"
+HEADER_TO = "To"
+HEADER_CC = "Cc"
+
+# Where the alias may be read from, in order. Deliberately short: Delivered-To names the final hop - the real mailbox, not
+# the alias - and To: only carries the alias in the cases this skips anyway.
+ALIAS_HEADER_PRECEDENCE = (HEADER_X_ORIGINAL_TO, HEADER_ENVELOPE_TO)
+
+# Headers a human sees in the reading pane. An alias visible in one of these
+# needs no label - the message already identifies itself.
+VISIBLE_RECIPIENT_HEADERS = (HEADER_TO, HEADER_CC)
+
+LABEL_ROOT = "to"
+LABEL_SEPARATOR = "/"
+# Gmail reads the separator as a nesting level, so it cannot survive inside a
+# single component of a label.
+LABEL_SEPARATOR_REPLACEMENT = "_"
+AT_SIGN = "@"
+
+
+def alias_from_headers(msg: email.message.Message) -> str | None:
+    """The bare address this message was actually delivered to, lowercased.
+
+    Lowercased because addresses differing only in case would otherwise split
+    into two gmail labels for one alias.
+    """
+    for header in ALIAS_HEADER_PRECEDENCE:
+        for raw in msg.get_all(header) or []:
+            _, address = email.utils.parseaddr(str(raw))
+            if address and AT_SIGN in address:
+                return address.lower()
+    return None
+
+
+def label_for_alias(alias: str | None) -> str | None:
+    """Map an address to its nested gmail label:
+    'alias@example.test' -> 'to/example.test/alias'.
+
+    Domain first, so gmail's sidebar groups every alias of one domain together.
+    Returns None rather than a catch-all label when there is nothing to map:
+    every message uploaded here came through procmail and has X-Original-To, so
+    a catch-all would collect noise rather than anything worth looking at.
+    """
+    if not alias or AT_SIGN not in alias:
+        return None
+    localpart, _, domain = alias.rpartition(AT_SIGN)
+    localpart = localpart.replace(LABEL_SEPARATOR, LABEL_SEPARATOR_REPLACEMENT)
+    domain = domain.replace(LABEL_SEPARATOR, LABEL_SEPARATOR_REPLACEMENT)
+    if not localpart or not domain:
+        return None
+    return LABEL_SEPARATOR.join((LABEL_ROOT, domain, localpart))
+
+
+def alias_is_visible(msg: email.message.Message, alias: str | None) -> bool:
+    """Can the alias already be read off the message's visible recipients?
+
+    Checks To: and Cc:, since a message may name the alias alongside several
+    other recipients and still be perfectly legible.
+    """
+    if not alias:
+        return False
+    values = [v for header in VISIBLE_RECIPIENT_HEADERS for v in msg.get_all(header) or []]
+    return any(address.lower() == alias.lower() for _, address in email.utils.getaddresses(values))
+
+
+def label_for_message(msg: email.message.Message) -> str | None:
+    """The label to apply to this message, or None to leave it unlabelled.
+
+    Only worth writing when the alias cannot already be read off To:/Cc:.
+    Otherwise it duplicates what the reading pane shows and buries the messages
+    that are actually opaque - on a live sample only 4 of 26 were.
+    """
+    alias = alias_from_headers(msg)
+    if alias_is_visible(msg, alias):
+        return None
+    return label_for_alias(alias)
 
 
 class AppendError(Exception):
