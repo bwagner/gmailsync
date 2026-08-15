@@ -302,7 +302,7 @@ def test_patch_message_id_replaces_the_header():
 
 
 def test_patch_message_id_returns_the_id_it_used():
-    patched, new_id = upload_eml.patch_message_id(b"Message-ID: <x@example.test>\r\n\r\nbody\r\n")
+    _, new_id = upload_eml.patch_message_id(b"Message-ID: <x@example.test>\r\n\r\nbody\r\n")
     assert new_id.startswith("<") and new_id.endswith(">")
 
 

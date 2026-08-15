@@ -107,6 +107,7 @@ def run_command(cmd: list[str], input: bytes | None = None) -> tuple[int, str]:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             env=env_with_user(os.environ),
+            check=False,
         )
     except (FileNotFoundError, PermissionError) as exc:
         return 1, f"could not run {cmd[0]}: {exc}"
@@ -201,11 +202,11 @@ def build_notification(entries: list[dict], gmail_user: str) -> bytes:
     msg["Date"] = email.utils.formatdate(localtime=True)
     msg["Subject"] = f"mailsync: {len(entries)} message(s) could not be uploaded"
     lines = [
-        f"{len(entries)} message(s) failed to upload to gmail for more than "
-        f"{GIVE_UP_DAYS} days and are no longer being retried.",
+        (f"{len(entries)} message(s) failed to upload to gmail for more than "
+         f"{GIVE_UP_DAYS} days and are no longer being retried."),
         "",
-        f"They have been placed in the '{STRANDED_MAILBOX}' mailbox on the mail "
-        "server, where any IMAP client will show them.",
+        (f"They have been placed in the '{STRANDED_MAILBOX}' mailbox on the mail "
+         "server, where any IMAP client will show them."),
         "",
     ]
     for entry in entries:

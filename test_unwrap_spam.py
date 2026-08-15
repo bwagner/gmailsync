@@ -175,8 +175,8 @@ def test_output_line_endings_become_lf():
         wrap(b"just a body\r\n"),
         wrap(b"From: a@example.test\r\n"),
         WRAPPED,
-        b'Subject: x\r\nContent-Type: multipart/mixed; boundary="b"\r\n\r\n--b\r\n'
-        b"Content-Type: message/rfc822\r\n\r\nFrom: a@example.test\r\n\r\nbody\r\n",
+        (b'Subject: x\r\nContent-Type: multipart/mixed; boundary="b"\r\n\r\n--b\r\n'
+         b"Content-Type: message/rfc822\r\n\r\nFrom: a@example.test\r\n\r\nbody\r\n"),
     ],
     ids=[
         "empty",

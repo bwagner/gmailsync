@@ -152,7 +152,7 @@ def test_stranding_saves_to_the_stranded_mailbox(pending):
     spool(pending, make_eml(), age_days=hk.GIVE_UP_DAYS + 1)
     runner = FakeRunner()
     hk.process_pending(pending, FakeUploader(failures=1), runner, now=time.time())
-    save = [c for c in runner.calls if "save" in c["cmd"]][0]
+    save = next(c for c in runner.calls if "save" in c["cmd"])
     assert hk.STRANDED_MAILBOX in save["cmd"]
 
 
@@ -161,7 +161,7 @@ def test_stranding_passes_the_message_on_stdin(pending):
     spool(pending, eml, age_days=hk.GIVE_UP_DAYS + 1)
     runner = FakeRunner()
     hk.process_pending(pending, FakeUploader(failures=1), runner, now=time.time())
-    save = [c for c in runner.calls if "save" in c["cmd"]][0]
+    save = next(c for c in runner.calls if "save" in c["cmd"])
     assert save["input"] == eml
 
 
@@ -426,7 +426,7 @@ MISSING_BINARY = "doveadm-that-does-not-exist"
 
 
 def test_a_missing_binary_does_not_raise():
-    code, out = hk.run_command([MISSING_BINARY, "mailbox", "list"])
+    code, _ = hk.run_command([MISSING_BINARY, "mailbox", "list"])
     assert code != 0
 
 

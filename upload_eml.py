@@ -144,7 +144,7 @@ if __name__ == "__main__":
         app_password = getpass.getpass("Gmail App Password: ")
         save_config(user, app_password)
         if not args.eml:
-            exit(0)
+            sys.exit(0)
 
     saved_user, saved_password = load_config()
     gmail_user = args.user or saved_user
