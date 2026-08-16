@@ -63,13 +63,23 @@ class AppendUid(NamedTuple):
 # than by SMTP it never sees that header - so the label has to be computed here.
 
 HEADER_X_ORIGINAL_TO = "X-Original-To"
-HEADER_ENVELOPE_TO = "Envelope-To"
+HEADER_X_ENVELOPE_TO = "X-Envelope-To"
 HEADER_TO = "To"
 HEADER_CC = "Cc"
 
-# Where the alias may be read from, in order. Deliberately short: Delivered-To names the final hop - the real mailbox, not
+# Where the alias may be read from, in order. Both are written by this machine:
+# X-Original-To by postfix at local delivery, X-Envelope-To by the spam milter at
+# SMTP time. The second is not redundant - the milter wraps a spam message before
+# postfix writes the first, so the unwrapped original carries only X-Envelope-To.
+#
+# Deliberately short. Delivered-To names the final hop - the real mailbox, not
 # the alias - and To: only carries the alias in the cases this skips anyway.
-ALIAS_HEADER_PRECEDENCE = (HEADER_X_ORIGINAL_TO, HEADER_ENVELOPE_TO)
+# Envelope-To is excluded for a sharper reason: unlike these two it arrives over
+# the wire, so it names whatever the last forwarder or the sender chose to put
+# there. A sender may also supply an X-Envelope-To, and it is not stripped; the
+# milter prepends its own above the original headers, so reading the first value
+# is what keeps a forged one from choosing the label.
+ALIAS_HEADER_PRECEDENCE = (HEADER_X_ORIGINAL_TO, HEADER_X_ENVELOPE_TO)
 
 # Headers a human sees in the reading pane. An alias visible in one of these
 # needs no label - the message already identifies itself.

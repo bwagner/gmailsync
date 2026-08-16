@@ -484,6 +484,16 @@ def message(**headers):
     return email.message_from_string(raw + "\r\n")
 
 
+def message_from_pairs(*pairs):
+    """Build a message from (header, value) pairs, so a header may repeat.
+
+    The keyword form cannot express a repeated header, and repetition is exactly
+    what separates the copy this machine wrote from a copy the sender supplied.
+    """
+    raw = "".join(f"{name}: {value}\r\n" for name, value in pairs)
+    return email.message_from_string(raw + "\r\n")
+
+
 # --- extracting the alias ---
 
 
@@ -492,14 +502,37 @@ def test_the_alias_comes_from_x_original_to():
     assert upload_eml.alias_from_headers(msg) == "alias@example.test"
 
 
-def test_envelope_to_is_the_fallback():
-    msg = message(Envelope_To="alias@example.test")
+def test_x_envelope_to_is_the_fallback():
+    """Spam loses X-Original-To: the milter wraps the message at SMTP time, before
+    postfix writes that header, so the wrapped original never carried it."""
+    msg = message(X_Envelope_To="alias@example.test")
     assert upload_eml.alias_from_headers(msg) == "alias@example.test"
 
 
-def test_x_original_to_wins_over_envelope_to():
-    msg = message(X_Original_To="first@example.test", Envelope_To="second@example.test")
+def test_x_original_to_wins_over_x_envelope_to():
+    msg = message(X_Original_To="first@example.test", X_Envelope_To="second@example.test")
     assert upload_eml.alias_from_headers(msg) == "first@example.test"
+
+
+def test_envelope_to_is_not_an_alias_source():
+    """It arrives over the wire, so it names whatever the last forwarder - or the
+    sender - put there, not an alias of ours. Measured 2026-08-16 on real mail:
+    a message forwarded by an upstream provider carried that provider's own
+    recipient here, and labelling from it produced a label for another host."""
+    msg = message(Envelope_To="someone-elses@example.test")
+    assert upload_eml.alias_from_headers(msg) is None
+
+
+def test_the_locally_written_x_envelope_to_wins_over_a_forged_one():
+    """A sender may supply this header too, and it is not stripped. The milter
+    prepends its own above the original headers, so first-wins is what keeps a
+    forged value from choosing the label - confirmed on live mail 2026-08-16."""
+    msg = message_from_pairs(
+        ("X-Envelope-To", "alias@example.test"),
+        ("Received", "from elsewhere"),
+        ("X-Envelope-To", "forged@evil.example"),
+    )
+    assert upload_eml.alias_from_headers(msg) == "alias@example.test"
 
 
 def test_delivered_to_is_not_an_alias_source():
@@ -537,8 +570,16 @@ def test_a_value_that_is_not_an_address_is_ignored():
 
 
 def test_a_later_header_is_used_when_the_first_is_unparseable():
-    msg = message(X_Original_To="garbage", Envelope_To="alias@example.test")
+    msg = message(X_Original_To="garbage", X_Envelope_To="alias@example.test")
     assert upload_eml.alias_from_headers(msg) == "alias@example.test"
+
+
+def test_an_unwrapped_spam_message_is_labelled_from_the_envelope_recipient():
+    """The shape the whole change exists for, as it arrives from the milter:
+    no X-Original-To, the real alias in X-Envelope-To, and an Envelope-To left
+    behind by an upstream forwarder that names a different host entirely."""
+    msg = message(X_Envelope_To="alias@example.test", Envelope_To="someone-elses@other.test")
+    assert upload_eml.label_for_message(msg) == "to/example.test/alias"
 
 
 # --- mapping an alias to a label ---

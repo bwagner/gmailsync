@@ -63,6 +63,17 @@ time, `alias@example.test` becoming `to/example.test/alias`. Domain first, so
 the sidebar groups every alias of one domain together. The label is created on
 first use; there is nothing to set up.
 
+Spam needs a second header. Where a milter tags and wraps a message at SMTP
+time, the wrapping happens before the forwarder writes `X-Original-To`, so the
+wrapped original never carries it - it carries `X-Envelope-To`, which the milter
+writes from the SMTP envelope. Both headers are read, `X-Original-To` first.
+
+Nothing else is read, and `Envelope-To` in particular is not. It looks like the
+same fact and is not: it arrives over the wire, so it names whatever the last
+forwarder - or the sender - chose to put there. A sender can supply an
+`X-Envelope-To` too, which is why the **first** value wins; the locally written
+one is prepended above the original headers.
+
 **Only messages whose alias is not already visible get one.** If the address
 appears in `To:` or `Cc:` the reading pane already shows it and a label would
 be noise - on a real sample that is about seven messages in eight. What is left
