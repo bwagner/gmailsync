@@ -70,7 +70,7 @@ writes from the SMTP envelope. Both headers are read, `X-Original-To` first.
 
 Nothing else is read, and `Envelope-To` in particular is not. It looks like the
 same fact and is not: it arrives over the wire, so it names whatever the last
-forwarder - or the sender - chose to put there. A sender can supply an
+hop - or the sender - chose to put there. A sender can supply an
 `X-Envelope-To` too, which is why the **first** value wins; the locally written
 one is prepended above the original headers.
 
@@ -89,12 +89,17 @@ it off without redeploying.
 
 ### Addresses that live at another provider
 
-An address at a third party which forwards here defeats all of the above. By
-the time the message arrives, the envelope recipient has been rewritten to
-whichever of your own addresses the forward points at, so `X-Original-To` names
-your endpoint and the address you actually handed out is one hop upstream,
-invisible to every header this machine writes. Labelling it truthfully would
-mean trusting a header that arrived over the wire.
+Everything above says "the forwarder" for your own MTA, the one that writes
+`X-Original-To`. This section is about a different actor one hop further out,
+called **the provider** throughout: someone else's mail service, holding an
+address of yours and relaying it to you.
+
+An address at such a provider defeats all of the above. By the time the message
+arrives, the envelope recipient has been rewritten to whichever of your own
+addresses the relay points at, so `X-Original-To` names your endpoint and the
+address you actually handed out is one hop upstream, invisible to every header
+this machine writes. Labelling it truthfully would mean trusting a header that
+arrived over the wire.
 
 The way out is to encode the upstream address into the endpoint's own
 localpart, so the fact travels inside the one string postfix will record:
@@ -104,8 +109,8 @@ localpart, so the fact travels inside the one string postfix will record:
 someone+at+other.example.test+k+7f3qa9mx@example.test
 ```
 
-Lodge that address with the forwarder instead of a plain one, and the message
-is labelled `to/other.example.test/someone` - the address you gave out, not the
+Lodge that address with the provider instead of a plain one, and the message is
+labelled `to/other.example.test/someone` - the address you gave out, not the
 pipe it came through. Nothing needs to be configured per address and there is
 no table to maintain; decoding is arithmetic.
 
@@ -116,17 +121,52 @@ plant a label under a domain they do not own. An address whose tag does not
 verify decodes to nothing and falls back to the ordinary rule, which labels it
 under your own domain where it is visibly yours and visibly junk.
 
-The key lives beside the app password:
+The key lives beside the app password, in the same config file, on the machine
+that runs the scripts. Generate one:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+and add it as its own section:
 
 ```ini
 [forwarding]
-key = <32+ random bytes, e.g. python3 -c "import secrets; print(secrets.token_urlsafe(32))">
+key = paste-the-generated-value-here
 ```
 
-Until that section exists the feature is simply off and every alias is labelled
-literally. Do not re-mint the key once endpoints are lodged with a forwarder -
-every one of them stops verifying, and mail arriving at them reverts to the
-literal label.
+Until that section exists the feature is simply off: endpoints do not decode and
+are labelled by their literal localpart, exactly as any other alias. Do not
+re-mint the key once endpoints are lodged with a provider - every one of them
+stops verifying, and mail arriving at them reverts to that literal label.
+
+#### Adding a new provider
+
+1. **Make sure the key exists and the scripts are deployed first.** Both are
+   read at delivery time. If you change the provider before this, mail starts
+   arriving at an endpoint nothing can decode and is labelled by its literal
+   localpart until you catch up - untidy, not lost.
+
+2. **Mint the address on the machine that holds the key** - the mail server, not
+   your workstation, unless you have deliberately put the key on both.
+
+   ```bash
+   ~/bin/upload_eml.py --encode-alias someone@other.example.test example.test
+   ```
+
+   Run it the way cron does if a bare path fails: the uv shebang needs
+   `~/.local/bin` on `PATH`, which a non-interactive shell does not have.
+
+3. **Lodge the printed address with the provider** as its forwarding target.
+
+4. **Let the confirmation mail be the test.** Providers generally send one to a
+   new forwarding address before they start using it, and it travels the entire
+   path - their relay, your MTA writing `X-Original-To`, procmail, the `APPEND`,
+   the decode, the label. If it lands under `to/other.example.test/someone`, the
+   whole chain works before any mail you care about depends on it.
+
+Mail that arrived before the switch keeps its old label, so both will sit in the
+sidebar for a while. That is expected, not a fault.
 
 ## Testing Upload to Gmail
 
@@ -151,6 +191,12 @@ failed (`upload_eml.py` spools them), gives up after a week by saving the
 message to a `Stranded` mailbox and mailing a summary, then expires old mail
 from the local INBOX. `--show-cron` checks whether cron and uv are usable and
 prints the line to install; `--dry-run` reports without changing anything.
+
+Its retry reads the same config, so it labels a recovered message exactly as the
+first attempt would have - forwarding endpoints included. Deploy it alongside
+`upload_eml.py` rather than on its own: if only one of the two can read the key,
+the label a message ends up with depends on which attempt happened to deliver
+it.
 
 The suggested line spells out the path to `uv` rather than relying on the
 shebang. Cron runs with a PATH that does not include where the uv installer
