@@ -164,6 +164,21 @@ def save_to_mailbox(eml: bytes, name: str, run=run_command) -> bool:
     return code == 0
 
 
+def make_uploader(gmail_user: str, app_password: str, forward_key: str | None):
+    """The upload callable `process_pending` drives, bound to one account.
+
+    The forwarding key travels with it deliberately. This path runs from cron
+    hours after the fact, and without the key a retried message could not decode
+    a forwarding endpoint - so which attempt happened to succeed would decide
+    what label the message ends up with.
+    """
+
+    def upload(eml: bytes, mailbox: str = INBOX_MAILBOX) -> None:
+        upload_eml.upload_eml_to_gmail(eml, gmail_user, app_password, mailbox, forward_key=forward_key)
+
+    return upload
+
+
 def process_pending(pending_dir: Path, upload, run=run_command, now=None,
                     give_up_days: int = GIVE_UP_DAYS) -> Outcome:
     """Retry every spooled message; strand the ones that have run out of time."""
@@ -322,8 +337,7 @@ def main(argv=None) -> int:
         print(f"No gmail credentials in {upload_eml.CONFIG_PATH}", file=sys.stderr)
         return 1
 
-    def upload(eml: bytes, mailbox: str = INBOX_MAILBOX) -> None:
-        upload_eml.upload_eml_to_gmail(eml, gmail_user, app_password, mailbox)
+    upload = make_uploader(gmail_user, app_password, upload_eml.load_forward_key())
 
     if args.dry_run:
         waiting = pending_messages(upload_eml.PENDING_DIR)

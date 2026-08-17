@@ -460,3 +460,63 @@ def test_expiry_preview_counts_matches_not_error_text():
     assert hk.count_matches(1, "could not run doveadm: nope") is None
     assert hk.count_matches(0, "id1\nid2\n") == 2
     assert hk.count_matches(0, "") == 0
+
+
+# --- the retry pass carries the forwarding key ------------------------------
+#
+# A message that fails its first upload is retried here, hours later and from
+# cron rather than from procmail. Without the key this path cannot decode a
+# forwarding endpoint, so a retried message would be labelled literally - or
+# not at all - while an identical message that succeeded first time is labelled
+# correctly. The label a message ends up with must not depend on which attempt
+# delivered it.
+
+APP_PASSWORD = "abcd efgh ijkl mnop"
+FORWARD_KEY = "test-key-not-a-real-secret"
+
+
+class RecordingUpload:
+    """Captures exactly what the uploader hands to upload_eml_to_gmail."""
+
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, eml, gmail_user, app_password, mailbox, **kwargs):
+        self.calls.append({"mailbox": mailbox, **kwargs})
+
+
+def test_the_retry_uploader_passes_the_forwarding_key(monkeypatch):
+    recorder = RecordingUpload()
+    monkeypatch.setattr(upload_eml, "upload_eml_to_gmail", recorder)
+    hk.make_uploader(GMAIL_USER, APP_PASSWORD, FORWARD_KEY)(make_eml())
+    assert recorder.calls[0]["forward_key"] == FORWARD_KEY
+
+
+def test_the_retry_uploader_works_without_a_key(monkeypatch):
+    """Absent is a normal state - the feature is simply off."""
+    recorder = RecordingUpload()
+    monkeypatch.setattr(upload_eml, "upload_eml_to_gmail", recorder)
+    hk.make_uploader(GMAIL_USER, APP_PASSWORD, None)(make_eml())
+    assert recorder.calls[0]["forward_key"] is None
+
+
+def test_the_retry_uploader_still_honours_the_mailbox(monkeypatch):
+    """Stranding uploads to a different mailbox, so it must stay a parameter."""
+    recorder = RecordingUpload()
+    monkeypatch.setattr(upload_eml, "upload_eml_to_gmail", recorder)
+    hk.make_uploader(GMAIL_USER, APP_PASSWORD, FORWARD_KEY)(make_eml(), "Stranded")
+    assert recorder.calls[0]["mailbox"] == "Stranded"
+
+
+def test_a_retried_message_gets_the_same_label_as_a_first_attempt(monkeypatch):
+    """The end the two tests above exist for, stated once against the real rule."""
+    endpoint = upload_eml.encode_forwarded_alias("someone@other.example.test", FORWARD_KEY, "example.test")
+    raw = f"X-Original-To: {endpoint}\r\nTo: nobody@example.test\r\nSubject: hi\r\n\r\nbody\r\n"
+    msg = email.message_from_string(raw)
+
+    recorder = RecordingUpload()
+    monkeypatch.setattr(upload_eml, "upload_eml_to_gmail", recorder)
+    hk.make_uploader(GMAIL_USER, APP_PASSWORD, FORWARD_KEY)(raw.encode())
+
+    key_used = recorder.calls[0]["forward_key"]
+    assert upload_eml.label_for_message(msg, key_used) == "to/other.example.test/someone"

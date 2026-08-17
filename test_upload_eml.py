@@ -980,3 +980,161 @@ def test_a_refused_append_is_still_an_error_and_labels_nothing(opaque_bytes):
     with pytest.raises(upload_eml.AppendError):
         upload(opaque_bytes, fake)
     assert fake.selects == [] and fake.stores == []
+
+
+# --- decoding a forwarding endpoint that encodes its upstream address -------
+#
+# An address at a third party that forwards here arrives with our own endpoint
+# in X-Original-To, so the address actually handed out is invisible. Encoding it
+# into the endpoint's own localpart puts it back into the one header this
+# machine writes itself. The MAC is what stops a catch-all domain from letting
+# anyone mint a label under someone else's domain.
+
+FORWARD_KEY = "test-key-not-a-real-secret"
+OTHER_KEY = "a-different-key"
+UPSTREAM = "someone@other.example.test"
+LOCAL_DOMAIN = "example.test"
+
+
+def encoded(upstream=UPSTREAM, key=FORWARD_KEY, domain=LOCAL_DOMAIN):
+    return upload_eml.encode_forwarded_alias(upstream, key, domain)
+
+
+def test_an_encoded_alias_round_trips():
+    assert upload_eml.decode_forwarded_alias(encoded(), FORWARD_KEY) == UPSTREAM
+
+
+def test_the_encoded_alias_is_an_address_at_the_local_domain():
+    assert encoded().endswith("@" + LOCAL_DOMAIN)
+
+
+def test_the_encoded_alias_carries_both_separators():
+    localpart = encoded().rpartition("@")[0]
+    assert upload_eml.FORWARD_AT_SEPARATOR in localpart
+    assert upload_eml.FORWARD_KEY_SEPARATOR in localpart
+
+
+def test_the_upstream_address_is_readable_in_the_encoded_form():
+    """Not a contract, but the point of the scheme is that a human can read it."""
+    assert "someone" in encoded() and "other.example.test" in encoded()
+
+
+def test_a_different_key_does_not_verify():
+    assert upload_eml.decode_forwarded_alias(encoded(), OTHER_KEY) is None
+
+
+def test_a_forged_domain_does_not_verify():
+    """The attack the MAC exists for: a catch-all accepts anything, so without
+    it anyone could plant a label under a domain they do not own."""
+    forged = encoded().replace("other.example.test", "elsewhere.test")
+    assert upload_eml.decode_forwarded_alias(forged, FORWARD_KEY) is None
+
+
+def test_a_forged_localpart_does_not_verify():
+    forged = encoded().replace("someone", "security")
+    assert upload_eml.decode_forwarded_alias(forged, FORWARD_KEY) is None
+
+
+def test_a_truncated_mac_does_not_verify():
+    localpart, _, domain = encoded().rpartition("@")
+    assert upload_eml.decode_forwarded_alias(f"{localpart[:-1]}@{domain}", FORWARD_KEY) is None
+
+
+def test_an_ordinary_alias_is_not_a_forwarding_endpoint():
+    assert upload_eml.decode_forwarded_alias("alias@example.test", FORWARD_KEY) is None
+
+
+def test_an_alias_with_the_at_separator_but_no_mac_does_not_verify():
+    assert upload_eml.decode_forwarded_alias("someone+at+other.example.test@example.test", FORWARD_KEY) is None
+
+
+def test_no_key_configured_decodes_nothing():
+    """The feature is off until a key exists, and off means today's behaviour."""
+    assert upload_eml.decode_forwarded_alias(encoded(), None) is None
+    assert upload_eml.decode_forwarded_alias(encoded(), "") is None
+
+
+def test_no_alias_decodes_to_nothing():
+    assert upload_eml.decode_forwarded_alias(None, FORWARD_KEY) is None
+    assert upload_eml.decode_forwarded_alias("", FORWARD_KEY) is None
+
+
+def test_a_decoded_domain_must_look_like_a_domain():
+    """Guards the label tree: a component with no dot is not a domain, however
+    well it verifies."""
+    with pytest.raises(ValueError):
+        upload_eml.encode_forwarded_alias("someone@localhost", FORWARD_KEY, LOCAL_DOMAIN)
+
+
+def test_an_upstream_without_an_at_sign_cannot_be_encoded():
+    with pytest.raises(ValueError):
+        upload_eml.encode_forwarded_alias("nonsense", FORWARD_KEY, LOCAL_DOMAIN)
+
+
+def test_an_overlong_localpart_is_refused_rather_than_silently_minted():
+    """RFC 5321 caps a localpart at 64 octets; an address over it may be
+    rejected by some hop, and finding out at delivery time is too late."""
+    with pytest.raises(ValueError):
+        upload_eml.encode_forwarded_alias("x" * 60 + "@other.example.test", FORWARD_KEY, LOCAL_DOMAIN)
+
+
+def test_case_does_not_break_verification():
+    """Some hops case-fold a localpart, and alias_from_headers lowercases."""
+    assert upload_eml.decode_forwarded_alias(encoded().upper(), FORWARD_KEY) == UPSTREAM
+
+
+def test_an_upstream_containing_the_separators_still_round_trips():
+    """Both splits take the last occurrence, so the separators may appear inside
+    the address being carried."""
+    awkward = "a+k+b+at+c@other.example.test"
+    assert upload_eml.decode_forwarded_alias(encoded(awkward), FORWARD_KEY) == awkward
+
+
+def test_the_mac_depends_on_the_whole_address():
+    assert encoded("a@other.example.test") != encoded("b@other.example.test")
+
+
+# --- the decoded alias is what gets labelled --------------------------------
+
+
+def test_a_forwarding_endpoint_is_labelled_with_its_upstream_address():
+    msg = message(X_Original_To=encoded(), To="someone@example.test")
+    assert upload_eml.label_for_message(msg, FORWARD_KEY) == "to/other.example.test/someone"
+
+
+def test_without_a_key_the_endpoint_is_labelled_literally():
+    """Falling through to today's behaviour, not to no label at all."""
+    label = upload_eml.label_for_message(message(X_Original_To=encoded()), None)
+    assert label.startswith("to/" + LOCAL_DOMAIN + "/")
+
+
+def test_a_forged_endpoint_is_labelled_literally_not_as_it_claims():
+    """The forged label must not appear anywhere - it lands under our own domain,
+    where it is visibly ours and visibly junk."""
+    forged = encoded().replace("other.example.test", "elsewhere.test")
+    label = upload_eml.label_for_message(message(X_Original_To=forged), FORWARD_KEY)
+    assert label.startswith("to/" + LOCAL_DOMAIN + "/")
+    assert "elsewhere.test/" not in label
+
+
+def test_an_ordinary_alias_is_unaffected_by_the_key():
+    msg = message(X_Original_To="alias@example.test", To="someone@example.test")
+    assert upload_eml.label_for_message(msg, FORWARD_KEY) == "to/example.test/alias"
+
+
+def test_a_visible_upstream_address_needs_no_label():
+    """Visibility is judged on the decoded address - that is what a human reads."""
+    msg = message(X_Original_To=encoded(), To=UPSTREAM)
+    assert upload_eml.label_for_message(msg, FORWARD_KEY) is None
+
+
+def test_a_visible_endpoint_does_not_excuse_an_invisible_upstream():
+    """The endpoint is the plumbing; seeing it tells the reader nothing."""
+    msg = message(X_Original_To=encoded(), To=encoded())
+    assert upload_eml.label_for_message(msg, FORWARD_KEY) == "to/other.example.test/someone"
+
+
+def test_label_for_message_still_works_without_a_key_argument():
+    """The key is optional, so no caller is forced to know about the feature."""
+    msg = message(X_Original_To="alias@example.test")
+    assert upload_eml.label_for_message(msg) == "to/example.test/alias"

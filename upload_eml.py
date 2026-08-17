@@ -4,8 +4,11 @@
 # dependencies = []
 # ///
 
+import base64
 import configparser
 import email
+import hashlib
+import hmac
 
 # Neither submodule is implied by `import email`. Both are named below - one in
 # an annotation - and the server's python 3.12 evaluates annotations eagerly, so
@@ -138,14 +141,107 @@ def alias_is_visible(msg: email.message.Message, alias: str | None) -> bool:
     return any(address.lower() == alias.lower() for _, address in email.utils.getaddresses(values))
 
 
-def label_for_message(msg: email.message.Message) -> str | None:
+# --- an alias that carries a third party's address inside it ----------------
+#
+# Mail sent to an address at another provider, which forwards it here, arrives
+# with our own endpoint in X-Original-To: the address actually handed out is one
+# hop upstream and no header this machine writes can see it. Encoding it into
+# the endpoint's own localpart puts it back where postfix will record it:
+#
+#     someone@other.example.test  ->  someone+at+other.example.test+k+7f3qa9mx@example.test
+#
+# The MAC is not decoration. These domains answer on a catch-all, so anyone may
+# send to any localpart; without it, a stranger could address
+# security+at+elsewhere.test@example.test and plant a label under a domain they do
+# not own. With it, an unverified address decodes to nothing and falls through
+# to the ordinary rule, which labels it under our own domain where it is
+# visibly ours and visibly junk.
+
+FORWARD_AT_SEPARATOR = "+at+"
+FORWARD_KEY_SEPARATOR = "+k+"
+
+# base32 of an HMAC-SHA256, truncated. The alphabet is a-z2-7 once lowercased,
+# every character of which is legal in a localpart and survives a hop that
+# case-folds one. 8 characters is 40 bits - far past brute force over SMTP,
+# and the truncation leaks nothing about the key.
+FORWARD_MAC_LENGTH = 8
+
+# RFC 5321 caps a localpart at 64 octets. Refusing to mint a longer one is the
+# only chance to find out before some hop rejects mail at delivery time.
+MAX_LOCALPART_OCTETS = 64
+
+# A carried domain must look like one. Guards the label tree specifically: the
+# decoded domain becomes the top level of the label, so a component with no dot
+# has no business there however well it verifies.
+FORWARD_DOMAIN_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
+
+CONFIG_SECTION_FORWARDING = "forwarding"
+CONFIG_OPTION_FORWARD_KEY = "key"
+
+
+def forward_mac(upstream: str, key: str) -> str:
+    """The tag proving this machine minted an endpoint for `upstream`."""
+    digest = hmac.new(key.encode(), upstream.strip().lower().encode(), hashlib.sha256).digest()
+    return base64.b32encode(digest).decode("ascii").lower()[:FORWARD_MAC_LENGTH]
+
+
+def encode_forwarded_alias(upstream: str, key: str, local_domain: str) -> str:
+    """The endpoint address to give a third-party forwarder, carrying `upstream`.
+
+    Raises ValueError rather than minting an address that cannot work: this runs
+    when a forward is being set up, where a refusal costs a moment, and the
+    alternative is discovering it when mail is already being lost.
+    """
+    localpart, _, domain = (upstream or "").strip().lower().rpartition(AT_SIGN)
+    if not localpart or not FORWARD_DOMAIN_PATTERN.match(domain):
+        raise ValueError(f"not an address that can be carried: {upstream!r}")
+    carried = f"{localpart}{AT_SIGN}{domain}"
+    encoded = f"{localpart}{FORWARD_AT_SEPARATOR}{domain}{FORWARD_KEY_SEPARATOR}{forward_mac(carried, key)}"
+    if len(encoded.encode()) > MAX_LOCALPART_OCTETS:
+        raise ValueError(f"localpart would be {len(encoded.encode())} octets, over the {MAX_LOCALPART_OCTETS} RFC 5321 allows: {carried!r}")
+    return f"{encoded}{AT_SIGN}{local_domain}"
+
+
+def decode_forwarded_alias(alias: str | None, key: str | None) -> str | None:
+    """The upstream address an endpoint carries, or None if it carries none.
+
+    None is the answer for every kind of no - not an endpoint, no key
+    configured, a MAC that does not verify - because the caller's response to
+    all of them is the same: fall through to the ordinary rule. Both splits take
+    the *last* occurrence, so an address containing a separator still survives
+    the round trip.
+    """
+    if not alias or not key:
+        return None
+    localpart, _, _local_domain = alias.strip().lower().rpartition(AT_SIGN)
+    if not localpart:
+        return None
+    carried, separator, mac = localpart.rpartition(FORWARD_KEY_SEPARATOR)
+    if not separator:
+        return None
+    upstream_local, separator, upstream_domain = carried.rpartition(FORWARD_AT_SEPARATOR)
+    if not separator or not upstream_local or not FORWARD_DOMAIN_PATTERN.match(upstream_domain):
+        return None
+    upstream = f"{upstream_local}{AT_SIGN}{upstream_domain}"
+    if not hmac.compare_digest(mac, forward_mac(upstream, key)):
+        return None
+    return upstream
+
+
+def label_for_message(msg: email.message.Message, forward_key: str | None = None) -> str | None:
     """The label to apply to this message, or None to leave it unlabelled.
 
     Only worth writing when the alias cannot already be read off To:/Cc:.
     Otherwise it duplicates what the reading pane shows and buries the messages
     that are actually opaque - on a live sample only 4 of 26 were.
+
+    Where the alias is a forwarding endpoint, the address it carries replaces it
+    outright, and is what the visibility test then asks about: the endpoint is
+    plumbing, and seeing it in To: tells a reader nothing about who was written
+    to. The key is optional, so the feature is simply off until one exists.
     """
     alias = alias_from_headers(msg)
+    alias = decode_forwarded_alias(alias, forward_key) or alias
     if alias_is_visible(msg, alias):
         return None
     return label_for_alias(alias)
@@ -164,9 +260,25 @@ def load_config() -> tuple[str, str]:
         return "", ""
 
 
+def load_forward_key() -> str | None:
+    """The HMAC key that makes a forwarding endpoint verifiable, if one is set.
+
+    Absent is a normal state, not an error: without it every alias is labelled
+    literally, exactly as before the encoding existed.
+    """
+    config = configparser.ConfigParser()
+    config.read(CONFIG_PATH)
+    key = config.get(CONFIG_SECTION_FORWARDING, CONFIG_OPTION_FORWARD_KEY, fallback="").strip()
+    return key or None
+
+
 def save_config(user: str, app_password: str) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     config = configparser.ConfigParser()
+    # Read before writing. This file also holds the forwarding key, and a fresh
+    # parser would drop it silently - re-minting it would invalidate every
+    # endpoint address already lodged with a forwarder.
+    config.read(CONFIG_PATH)
     config["gmail"] = {"user": user, "app_password": app_password}
     with CONFIG_PATH.open("w") as f:
         config.write(f)
@@ -374,7 +486,7 @@ def spool_failed(eml: bytes, pending_dir: Path = PENDING_DIR) -> Path:
     return final
 
 
-def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox: str = "INBOX", imap_factory=imaplib.IMAP4_SSL, timeout: int = IMAP_TIMEOUT_SECONDS, apply_labels: bool = True) -> UploadResult:
+def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox: str = "INBOX", imap_factory=imaplib.IMAP4_SSL, timeout: int = IMAP_TIMEOUT_SECONDS, apply_labels: bool = True, forward_key: str | None = None) -> UploadResult:
     """Append the message to gmail, and label it with the alias it was sent to.
 
     The label is applied over the same connection, and only when the alias is
@@ -395,7 +507,7 @@ def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox:
         check_append_result(typ, data)
         appenduid = parse_appenduid(data)
 
-        label = label_for_message(msg) if apply_labels else None
+        label = label_for_message(msg, forward_key) if apply_labels else None
         if label is None:
             return UploadResult(appenduid, None, False)
 
@@ -426,7 +538,20 @@ if __name__ == "__main__":
     parser.add_argument("--save-credentials", action="store_true", help="Prompt for credentials and save to config file")
     parser.add_argument("--no-spool", "-S", dest="spool", action="store_false", help=f"Do not keep a failed message in {PENDING_DIR} for retry")
     parser.add_argument("--no-label", "-L", dest="label", action="store_false", help="Do not label the message with the alias it was addressed to")
+    parser.add_argument("--encode-alias", "-e", nargs=2, metavar=("UPSTREAM", "DOMAIN"), help="Print the endpoint address to lodge with a forwarder, carrying UPSTREAM, at DOMAIN")
     args = parser.parse_args()
+
+    if args.encode_alias:
+        forward_key = load_forward_key()
+        if not forward_key:
+            print(f"No [{CONFIG_SECTION_FORWARDING}] {CONFIG_OPTION_FORWARD_KEY} in {CONFIG_PATH}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            print(encode_forwarded_alias(args.encode_alias[0], forward_key, args.encode_alias[1]))
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            sys.exit(1)
+        sys.exit(0)
 
     if args.save_credentials:
         user = args.user or input("Gmail address: ")
@@ -448,7 +573,7 @@ if __name__ == "__main__":
         print(f"Patched Message-ID: {patched_id}")
 
     try:
-        upload_eml_to_gmail(eml, gmail_user, app_password, args.mailbox, apply_labels=args.label)
+        upload_eml_to_gmail(eml, gmail_user, app_password, args.mailbox, apply_labels=args.label, forward_key=load_forward_key())
     except (AppendError, TimeoutError) as exc:
         reason = exc if isinstance(exc, AppendError) else f"IMAP timed out after {IMAP_TIMEOUT_SECONDS}s: {exc}"
         print(reason, file=sys.stderr)

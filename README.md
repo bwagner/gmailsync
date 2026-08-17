@@ -87,6 +87,47 @@ unexpected costs the label and nothing more - it is not worth a
 `Program failure` line for a message that arrived. Pass `--no-label` to switch
 it off without redeploying.
 
+### Addresses that live at another provider
+
+An address at a third party which forwards here defeats all of the above. By
+the time the message arrives, the envelope recipient has been rewritten to
+whichever of your own addresses the forward points at, so `X-Original-To` names
+your endpoint and the address you actually handed out is one hop upstream,
+invisible to every header this machine writes. Labelling it truthfully would
+mean trusting a header that arrived over the wire.
+
+The way out is to encode the upstream address into the endpoint's own
+localpart, so the fact travels inside the one string postfix will record:
+
+```bash
+./upload_eml.py --encode-alias someone@other.example.test example.test
+someone+at+other.example.test+k+7f3qa9mx@example.test
+```
+
+Lodge that address with the forwarder instead of a plain one, and the message
+is labelled `to/other.example.test/someone` - the address you gave out, not the
+pipe it came through. Nothing needs to be configured per address and there is
+no table to maintain; decoding is arithmetic.
+
+The `+k+` part is a truncated HMAC, and it is load-bearing. These domains
+usually answer on a catch-all, so anyone may send to any localpart; without a
+MAC a stranger could address `security+at+elsewhere.example.test@example.test` and
+plant a label under a domain they do not own. An address whose tag does not
+verify decodes to nothing and falls back to the ordinary rule, which labels it
+under your own domain where it is visibly yours and visibly junk.
+
+The key lives beside the app password:
+
+```ini
+[forwarding]
+key = <32+ random bytes, e.g. python3 -c "import secrets; print(secrets.token_urlsafe(32))">
+```
+
+Until that section exists the feature is simply off and every alias is labelled
+literally. Do not re-mint the key once endpoints are lodged with a forwarder -
+every one of them stops verifying, and mail arriving at them reverts to the
+literal label.
+
 ## Testing Upload to Gmail
 
 ```bash
