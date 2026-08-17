@@ -447,11 +447,16 @@ def apply_label(imap, mailbox: str, label: str, appenduid: AppendUid | None, mes
 
 
 class UploadResult(NamedTuple):
-    """What became of one message: where it landed, and whether it got labelled."""
+    """What became of one message: where it landed, and whether it got labelled.
+
+    `append_response` carries the server's own words about the APPEND, so the
+    caller can report them without this function writing to stdout itself.
+    """
 
     appenduid: AppendUid | None
     label: str | None
     labelled: bool
+    append_response: str
 
 
 def read_eml(eml_path: str) -> bytes:
@@ -492,6 +497,13 @@ def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox:
     The label is applied over the same connection, and only when the alias is
     not already visible in To:/Cc: - which is most messages, and those pay no
     extra round trip at all.
+
+    **Nothing here prints to stdout.** Two callers drive this with opposite
+    conventions - procmail discards stdout, cron mails every byte of it - so a
+    success line written here reaches the mailbox as an alarm about a message
+    that arrived perfectly well. Success travels back in UploadResult and the
+    caller decides. Warnings stay on stderr: only stderr reaches procmail's log,
+    and cron mail is the only place the retry path can report a lost label.
     """
     msg = email.message_from_bytes(eml)
     date_str = msg.get("Date")
@@ -503,13 +515,13 @@ def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox:
     with imap_factory(IMAP_HOST, IMAP_PORT, timeout=timeout) as imap:
         imap.login(gmail_user, app_password)
         typ, data = imap.append(mailbox, None, imaplib.Time2Internaldate(timestamp), eml)
-        print(f"Result: {typ} {_describe(data)}".rstrip())
         check_append_result(typ, data)
+        append_response = f"{typ} {_describe(data)}".rstrip()
         appenduid = parse_appenduid(data)
 
         label = label_for_message(msg, forward_key) if apply_labels else None
         if label is None:
-            return UploadResult(appenduid, None, False)
+            return UploadResult(appenduid, None, False, append_response)
 
         # The message is in gmail from here on, so nothing below may raise.
         # Anything at all - a refusal, a stall, a response shaped differently
@@ -518,12 +530,10 @@ def upload_eml_to_gmail(eml: bytes, gmail_user: str, app_password: str, mailbox:
             labelled = apply_label(imap, mailbox, label, appenduid, msg.get(HEADER_MESSAGE_ID))
         except Exception as exc:  # noqa: BLE001
             print(f"Uploaded but could not label {label}: {exc}", file=sys.stderr)
-            return UploadResult(appenduid, label, False)
-        if labelled:
-            print(f"Labelled: {label}")
-        else:
+            return UploadResult(appenduid, label, False, append_response)
+        if not labelled:
             print(f"Uploaded but could not label {label}", file=sys.stderr)
-        return UploadResult(appenduid, label, labelled)
+        return UploadResult(appenduid, label, labelled, append_response)
 
 
 if __name__ == "__main__":
@@ -573,7 +583,7 @@ if __name__ == "__main__":
         print(f"Patched Message-ID: {patched_id}")
 
     try:
-        upload_eml_to_gmail(eml, gmail_user, app_password, args.mailbox, apply_labels=args.label, forward_key=load_forward_key())
+        result = upload_eml_to_gmail(eml, gmail_user, app_password, args.mailbox, apply_labels=args.label, forward_key=load_forward_key())
     except (AppendError, TimeoutError) as exc:
         reason = exc if isinstance(exc, AppendError) else f"IMAP timed out after {IMAP_TIMEOUT_SECONDS}s: {exc}"
         print(reason, file=sys.stderr)
@@ -585,3 +595,9 @@ if __name__ == "__main__":
             except OSError as spool_error:
                 print(f"Could not spool the message: {spool_error}", file=sys.stderr)
         sys.exit(1)
+
+    # Only here, at the entry point procmail drives. The library stays silent so
+    # that the same call from the hourly cron job does not mail a success.
+    print(f"Result: {result.append_response}")
+    if result.labelled:
+        print(f"Labelled: {result.label}")

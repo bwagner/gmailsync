@@ -982,6 +982,53 @@ def test_a_refused_append_is_still_an_error_and_labels_nothing(opaque_bytes):
     assert fake.selects == [] and fake.stores == []
 
 
+# --- silence on success, so cron mail keeps meaning something ---------------
+#
+# The uploader runs from two callers with opposite conventions: procmail throws
+# stdout away, while cron mails *any* output at all. So a success line printed
+# from in here became mail every time the hourly retry worked - inverting the
+# one signal the housekeeping job was built to give, that mail means something
+# needs looking at. The facts ride home on UploadResult instead, and only the
+# caller decides whether to print them.
+#
+# Warnings stay on stderr deliberately: `Uploaded but could not label` is not
+# a delivery failure, so cron mail is the only place it can surface.
+
+
+def test_a_successful_upload_prints_nothing_to_stdout(eml_bytes, capsys):
+    fake = FakeIMAP(data=OBSERVED_APPEND_DATA)
+    upload(eml_bytes, fake)
+    assert capsys.readouterr().out == ""
+
+
+def test_a_labelled_upload_prints_nothing_to_stdout(opaque_bytes, capsys):
+    """The labelled branch is the one the retry path actually exercises."""
+    fake = FakeIMAP(data=OBSERVED_APPEND_DATA)
+    result = upload(opaque_bytes, fake)
+    assert result.labelled is True
+    assert capsys.readouterr().out == ""
+
+
+def test_the_result_carries_the_servers_append_response(eml_bytes):
+    """What the caller needs to print the line this function used to print."""
+    fake = FakeIMAP(data=OBSERVED_APPEND_DATA)
+    result = upload(eml_bytes, fake)
+    assert result.append_response == f"{STATUS_OK} {OBSERVED_APPEND_DATA[0].decode()}"
+
+
+def test_a_missing_label_still_warns_on_stderr(opaque_bytes, capsys):
+    """Silencing stdout must not silence the only report of a lost label."""
+    fake = FakeIMAP(data=OBSERVED_APPEND_DATA, store_status=STATUS_NO)
+    upload(opaque_bytes, fake)
+    assert EXPECTED_LABEL in capsys.readouterr().err
+
+
+def test_an_exploding_label_step_still_warns_on_stderr(opaque_bytes, capsys):
+    fake = ExplodingLabelIMAP(data=OBSERVED_APPEND_DATA)
+    upload(opaque_bytes, fake)
+    assert EXPECTED_LABEL in capsys.readouterr().err
+
+
 # --- decoding a forwarding endpoint that encodes its upstream address -------
 #
 # An address at a third party that forwards here arrives with our own endpoint
