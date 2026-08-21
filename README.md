@@ -240,3 +240,38 @@ uv run --with pytest pytest -q
 
 No `pyproject.toml` and no declared dependencies - pytest is supplied by uv at
 run time, so the scripts stay stdlib-only and deployable as single files.
+
+## Contributing
+
+### This repo is public
+
+The system it drives is not. Before committing any file, check it carries none
+of:
+
+- server hostnames or internal domains
+- the name of any other project
+- real email addresses - use `example.test`
+- paths, log excerpts or details specific to one machine's setup
+
+That applies to code, comments, docstrings, test fixtures and commit messages
+alike. Operational and local context belongs outside this repo.
+
+### Conventions
+
+- Stdlib only, and no declared dependencies - see [Tests](#tests) for why.
+- Scripts carry a `#!/usr/bin/env -S uv run --script` shebang and an empty
+  `dependencies = []` block.
+- Keep a pure, testable core separate from the thin `__main__` that wraps it.
+
+### Care
+
+These scripts run inside a mail delivery path, where an unhandled exception
+costs a copy of someone's mail. Prefer failing loudly over failing silently,
+and prefer returning the input unchanged over raising.
+
+A measured maximum is not a bound. A 60 s timeout chosen as "4x the worst
+observed" was exceeded by real traffic within the hour.
+
+Note that the tests talk to a **live** mailbox, so running them has consequences
+the suite itself does not: send APPEND tests to `"[Gmail]/Trash"` rather than
+INBOX, and avoid bursts of IMAP connections.
